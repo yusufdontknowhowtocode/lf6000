@@ -306,6 +306,8 @@ app.get('/download/:file', (req, res) => {
   }
   res.download(path.join(__dirname, base));
 });
+// Redirect root to the UI
+app.get('/', (_req, res) => res.redirect('/public/index.html'));
 
 // Health
 app.get('/api/health', (_req, res) => res.json({ ok: true }));
