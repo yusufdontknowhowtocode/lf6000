@@ -52,3 +52,22 @@ async function fetchText(url, timeoutMs = 8000) {
     clearTimeout(t);
   }
 }
+// src/enrich.js (add a timeout wrapper and use it for all fetch calls)
+const DEFAULT_TIMEOUT_MS = Number(process.env.HTTP_TIMEOUT_MS || 10000);
+
+async function fetchWithTimeout(url, ms = DEFAULT_TIMEOUT_MS, init = {}) {
+  const ctrl = new AbortController();
+  const id = setTimeout(() => ctrl.abort(), ms);
+  try {
+    const res = await fetch(url, { ...init, signal: ctrl.signal, headers: {
+      'user-agent': 'Mozilla/5.0 (Prospector bot; contact info@agentlyne.com)'
+    }});
+    return res;
+  } finally {
+    clearTimeout(id);
+  }
+}
+
+// …wherever you had: const res = await fetch(url)
+// replace with:
+const res = await fetchWithTimeout(url);

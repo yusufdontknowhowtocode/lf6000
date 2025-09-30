@@ -3,6 +3,8 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
+import fs from 'fs';
+import fsp from 'fs/promises';
 import { fileURLToPath } from 'url';
 
 import { findBusinesses } from './src/places.js';
@@ -23,9 +25,7 @@ app.set('trust proxy', true); // respect X-Forwarded-Proto/IP on Render/CF
 const BASIC_USER = process.env.BASIC_AUTH_USER || '';
 const BASIC_PASS = process.env.BASIC_AUTH_PASS || '';
 const ALLOW_IPS  = (process.env.ALLOW_IPS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
+  .split(',').map(s => s.trim()).filter(Boolean);
 
 // HTTPS only (redirect if someone hits http behind a proxy)
 app.use((req, res, next) => {
@@ -53,8 +53,6 @@ function basicAuth(req, res, next) {
   res.set('WWW-Authenticate', 'Basic realm="LF6000"');
   return res.status(401).send('Auth required');
 }
-
-// put this BEFORE any routes/static
 app.use(basicAuth);
 
 // Optional IP allow-list (before auth)
@@ -125,6 +123,29 @@ const pushLog = (job, message) => {
   }
 };
 
+/* -------------------- Persistent sent-registry (dedupe) ------------------ */
+const dataDir  = path.join(__dirname, 'data');
+const sentPath = path.join(dataDir, 'sent.jsonl');
+
+// Load existing sent list (if any)
+if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+const SENT = new Set();
+if (fs.existsSync(sentPath)) {
+  try {
+    const lines = fs.readFileSync(sentPath, 'utf8').split('\n').map(s => s.trim()).filter(Boolean);
+    for (const line of lines) SENT.add(line.toLowerCase());
+    console.log(`[dedupe] Loaded ${SENT.size} prior emails`);
+  } catch (e) {
+    console.warn('[dedupe] Failed to load file:', e.message);
+  }
+}
+function rememberSent(email) {
+  const key = String(email || '').toLowerCase();
+  if (!key || SENT.has(key)) return;
+  fs.appendFileSync(sentPath, key + '\n');
+  SENT.add(key);
+}
+
 /* ------------------------------- Endpoints ------------------------------- */
 
 // SMTP sanity check
@@ -182,6 +203,9 @@ app.post('/api/run', async (req, res) => {
     .filter(Boolean);
 
   const maxSend = Number(cap || process.env.DEFAULT_SEND_CAP || 200);
+  const perCityCap = Number(process.env.MAX_PER_CITY || 300); // optional
+  const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || 10000);
+
   const jobId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
   const job = {
@@ -191,6 +215,9 @@ app.post('/api/run', async (req, res) => {
     stats: { found: 0, withEmail: 0, sent: 0, skipped: 0 },
   };
   jobs.set(jobId, job);
+
+  // live heartbeat so UI doesn't feel stuck on slow sites
+  job._hb = setInterval(() => pushLog(job, '⏳ still working…'), HEARTBEAT_MS);
 
   (async () => {
     const rows = [];
@@ -202,11 +229,14 @@ app.post('/api/run', async (req, res) => {
 
       let batch = [];
       try {
-        batch = await findBusinesses(city, niche, 300);
+        batch = await findBusinesses(city, niche, perCityCap);
       } catch (e) {
         pushLog(job, `💥 Places error for ${city}: ${String(e)}`);
         continue;
       }
+
+      // safety cap
+      if (perCityCap > 0 && batch.length > perCityCap) batch = batch.slice(0, perCityCap);
 
       pushLog(job, `📍 Found ${batch.length} businesses in ${city}.`);
 
@@ -214,7 +244,10 @@ app.post('/api/run', async (req, res) => {
         job.stats.found++;
 
         let email = null;
-        try { email = await findEmailOnSite(b.website); } catch {}
+        try {
+          email = await findEmailOnSite(b.website); // add fetch timeouts INSIDE enrich.js
+        } catch {}
+
         if (!email) {
           job.stats.skipped++;
           pushLog(job, `❎ No email for ${b.name || 'Unknown'} (${city})`);
@@ -222,7 +255,13 @@ app.post('/api/run', async (req, res) => {
         }
 
         const key = email.toLowerCase();
-        if (seenEmails.has(key)) { job.stats.skipped++; continue; }
+
+        // Skip if seen in this run OR sent in prior runs
+        if (seenEmails.has(key) || SENT.has(key)) {
+          job.stats.skipped++;
+          continue;
+        }
+
         seenEmails.add(key);
         job.stats.withEmail++;
 
@@ -236,10 +275,13 @@ app.post('/api/run', async (req, res) => {
         const render = (tpl) => String(tpl || '').replace(/\{(\w+)\}/g, (_, k) => ctx[k] ?? '');
 
         const subj = render(subject || 'Quick idea for {company}');
-        const txt  = render(body || 'Hey {firstName}, quick idea for {company} in {city}. Free demo: {yourSite}');
+        const txt  = render(
+          body || 'Hey {firstName}, quick idea for {company} in {city}. Free demo: {yourSite}'
+        );
 
         try {
           await sendEmail(email, subj, txt);
+          rememberSent(email); // persist dedupe on success
           job.stats.sent++;
           rows.push({ email, company: b.name || '', city, website: b.website || '', status: 'sent' });
           pushLog(job, `✅ Sent to ${email} (${b.name || 'Unknown'})`);
@@ -250,7 +292,7 @@ app.post('/api/run', async (req, res) => {
         }
 
         if (job.stats.sent >= maxSend) break;
-        await sleep(1500);
+        await sleep(1500); // throttle while warming mailbox
       }
       if (job.stats.sent >= maxSend) break;
     }
@@ -274,6 +316,8 @@ app.post('/api/run', async (req, res) => {
   })().catch((e) => {
     pushLog(job, '💥 Job error: ' + String(e));
     job.done = true;
+  }).finally(() => {
+    if (job._hb) clearInterval(job._hb);
   });
 
   res.json({ jobId });
@@ -306,6 +350,7 @@ app.get('/download/:file', (req, res) => {
   }
   res.download(path.join(__dirname, base));
 });
+
 // Redirect root to the UI
 app.get('/', (_req, res) => res.redirect('/public/index.html'));
 
