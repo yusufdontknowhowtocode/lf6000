@@ -1,0 +1,12 @@
+
+node_modules/
+.DS_Store
+.env
+*.env
+*.env.*
+results-*.csv
+*.log
+npm-debug.log*
+yarn-error.log*
+.vscode/
+.idea/

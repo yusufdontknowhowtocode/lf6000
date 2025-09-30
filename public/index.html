@@ -1,0 +1,154 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Auto Prospector</title>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+  </head>
+  <body class="bg-gray-50">
+    <div class="max-w-4xl mx-auto p-6">
+      <h1 class="text-2xl font-semibold mb-4">Auto Prospector</h1>
+
+      <div class="bg-white rounded-xl shadow p-5 space-y-4">
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div>
+            <label class="text-sm text-gray-600">Niche (e.g., “orthodontist”, “HVAC”)</label>
+            <input id="niche" class="mt-1 w-full border rounded px-3 py-2" placeholder="orthodontist">
+          </div>
+          <div class="md:col-span-2">
+            <label class="text-sm text-gray-600">Cities (comma separated, optional)</label>
+            <input id="cities" class="mt-1 w-full border rounded px-3 py-2" placeholder="Miami, Austin, Phoenix">
+          </div>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div>
+            <label class="text-sm text-gray-600">Max Sends</label>
+            <input id="cap" type="number" class="mt-1 w-full border rounded px-3 py-2" value="200">
+          </div>
+          <div class="md:col-span-2">
+            <label class="text-sm text-gray-600">Subject</label>
+            <input id="subject" class="mt-1 w-full border rounded px-3 py-2"
+              value="Quick idea to stop missed calls at {company}">
+          </div>
+        </div>
+
+        <div>
+          <label class="text-sm text-gray-600">Your website URL (shown as “Free demo”)</label>
+          <input id="yourSite" class="mt-1 w-full border rounded px-3 py-2" value="https://agentlyne.com">
+        </div>
+
+        <div>
+          <label class="text-sm text-gray-600">Body (supports {company}, {city}, {firstName}, {website}, {yourSite})</label>
+          <textarea id="body" rows="10" class="mt-1 w-full border rounded px-3 py-2">Hey {firstName},
+
+Noticed {company} in {city} is likely missing after-hours calls from {website}.
+We plug in a 24/7 AI receptionist that answers, qualifies, and books—so missed calls = booked jobs, not lost revenue.
+
+Typical lift: +15–35% more booked appointments in 2–3 weeks.
+Free demo + details: {yourSite}
+
+Worth a quick look?
+
+– Your Name
+
+—
+Don’t want emails like this? Reply “unsubscribe” and I’ll remove you.</textarea>
+        </div>
+
+        <div class="flex items-center gap-3">
+          <button id="run" class="bg-blue-600 hover:bg-blue-700 text-white rounded px-4 py-2">Run</button>
+          <a id="download" class="text-blue-700 underline hidden" href="#">Download results.csv</a>
+          <div id="stats" class="text-sm text-gray-600 ml-auto"></div>
+        </div>
+      </div>
+
+      <div class="mt-6 bg-white rounded-xl shadow p-5">
+        <div class="flex items-center justify-between">
+          <h2 class="font-medium">Live Log</h2>
+          <button id="clear" class="text-sm text-gray-500 hover:text-gray-700">Clear</button>
+        </div>
+        <pre id="log" class="mt-3 h-80 overflow-auto text-sm bg-gray-50 p-3 rounded"></pre>
+      </div>
+    </div>
+
+    <script>
+      const runBtn = document.getElementById("run");
+      const logEl = document.getElementById("log");
+      const clearBtn = document.getElementById("clear");
+      const dl = document.getElementById("download");
+      const statsEl = document.getElementById("stats");
+
+      // persist form locally so you don't have to retype
+      const FIELDS = ["niche","cities","cap","subject","yourSite","body"];
+      function loadSaved() {
+        FIELDS.forEach(id => {
+          const el = document.getElementById(id);
+          const saved = localStorage.getItem("prospector:" + id);
+          if (saved !== null) el.value = saved;
+        });
+      }
+      function autosave() {
+        FIELDS.forEach(id => {
+          const el = document.getElementById(id);
+          el.addEventListener("input", () =>
+            localStorage.setItem("prospector:" + id, el.value)
+          );
+        });
+      }
+      loadSaved();
+      autosave();
+
+      clearBtn.onclick = () => (logEl.textContent = "");
+
+      runBtn.onclick = async () => {
+        dl.classList.add("hidden");
+        logEl.textContent = "";
+        statsEl.textContent = "Starting…";
+
+        const rawBody = document.getElementById("body").value;
+        const body = rawBody.replaceAll("{yourSite}", document.getElementById("yourSite").value.trim());
+
+        const payload = {
+          niche: document.getElementById("niche").value.trim(),
+          cities: document.getElementById("cities").value.trim(),
+          cap: Number(document.getElementById("cap").value || 200),
+          subject: document.getElementById("subject").value,
+          body
+        };
+
+        const r = await fetch("/api/run", {
+          method:"POST",
+          headers:{ "Content-Type":"application/json" },
+          body: JSON.stringify(payload)
+        });
+        const { jobId, error } = await r.json();
+        if (error) { append(`ERROR: ${error}`); return; }
+
+        const es = new EventSource(`/api/stream?jobId=${jobId}`);
+        es.addEventListener("log", e => {
+          const { ts, message } = JSON.parse(e.data);
+          append(`[${new Date(ts).toLocaleTimeString()}] ${message}`);
+        });
+        es.addEventListener("stats", e => {
+          const s = JSON.parse(e.data);
+          statsEl.textContent = `Found: ${s.found} | With email: ${s.withEmail} | Sent: ${s.sent} | Skipped: ${s.skipped}`;
+        });
+        es.addEventListener("done", e => {
+          const d = JSON.parse(e.data);
+          if (d.file) {
+            dl.href = d.file;
+            dl.classList.remove("hidden");
+          }
+          es.close();
+        });
+      };
+
+      function append(line) {
+        logEl.textContent += line + "\n";
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+    </script>
+  </body>
+</html>
