@@ -36,6 +36,27 @@ app.use((req, res, next) => {
   next();
 });
 
+// --- Basic Auth (optional; enabled only if env vars are set)
+function basicAuth(req, res, next) {
+  const user = process.env.BASIC_AUTH_USER;
+  const pass = process.env.BASIC_AUTH_PASS || '';
+  if (!user) return next(); // disabled if no creds
+
+  const hdr = req.headers.authorization || '';
+  if (!hdr.startsWith('Basic ')) {
+    res.set('WWW-Authenticate', 'Basic realm="LF6000"');
+    return res.status(401).send('Auth required');
+  }
+  const [u, p] = Buffer.from(hdr.slice(6), 'base64').toString().split(':');
+  if (u === user && p === pass) return next();
+
+  res.set('WWW-Authenticate', 'Basic realm="LF6000"');
+  return res.status(401).send('Auth required');
+}
+
+// put this BEFORE any routes/static
+app.use(basicAuth);
+
 // Optional IP allow-list (before auth)
 app.use((req, res, next) => {
   if (!ALLOW_IPS.length) return next();
