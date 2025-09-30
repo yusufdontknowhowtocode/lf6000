@@ -1,73 +1,46 @@
 // src/enrich.js
-const EMAIL_RE = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/ig;
+import 'dotenv/config';
 
-export async function findEmailOnSite(website) {
-  if (!website) return null;
+const TIMEOUT_MS = Number(process.env.HTTP_TIMEOUT_MS || 10000);
 
-  const urls = dedupe([
-    normalize(website),
-    normalize(website) + '/contact',
-    normalize(website) + '/contact-us',
-  ]);
-
-  for (const u of urls) {
-    try {
-      const html = await fetchText(u, 6000);
-      if (!html) continue;
-
-      const emails = [...new Set((html.match(EMAIL_RE) || []).map(e => e.toLowerCase()))];
-      // Prefer non-generic if possible
-      const preferred = emails.find(e => !/info@|hello@|support@|admin@|noreply@/.test(e));
-      if (preferred) return preferred;
-      if (emails.length) return emails[0];
-    } catch {
-      // ignore and move on
-    }
-  }
-  return null;
+/** fetch with AbortController timeout */
+function fetchWithTimeout(resource, opts = {}) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  return fetch(resource, { ...opts, signal: controller.signal, redirect: 'follow' })
+    .finally(() => clearTimeout(id));
 }
 
-function normalize(u) {
+/** normalize a site string to an absolute https URL */
+function normalizeUrl(site) {
+  if (!site) return null;
+  let s = String(site).trim();
+  if (!/^https?:\/\//i.test(s)) s = 'https://' + s.replace(/^\/+/, '');
+  return s;
+}
+
+/**
+ * Try to find an email address on the site's homepage.
+ * Returns the first email found (string) or null.
+ */
+export async function findEmailOnSite(site) {
+  const url = normalizeUrl(site);
+  if (!url) return null;
+
   try {
-    const url = new URL(u.startsWith('http') ? u : `https://${u}`);
-    url.hash = '';
-    return url.toString().replace(/\/$/, '');
+    const res = await fetchWithTimeout(url);
+    if (!res.ok) return null;
+    const html = await res.text();
+
+    // Prefer mailto: addresses
+    const m1 = html.match(/mailto:([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})/i);
+    if (m1) return m1[1];
+
+    // Fall back to raw emails in the page
+    const m2 = html.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+    return m2 ? m2[0] : null;
   } catch {
-    return '';
+    // timeout / network / abort -> just skip
+    return null;
   }
 }
-
-function dedupe(arr) { return [...new Set(arr.filter(Boolean))]; }
-
-async function fetchText(url, timeoutMs = 8000) {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { signal: ctrl.signal, redirect: 'follow' });
-    if (!res.ok) return '';
-    const ct = res.headers.get('content-type') || '';
-    if (!/text\/html|application\/xhtml\+xml/i.test(ct)) return '';
-    return await res.text();
-  } finally {
-    clearTimeout(t);
-  }
-}
-// src/enrich.js (add a timeout wrapper and use it for all fetch calls)
-const DEFAULT_TIMEOUT_MS = Number(process.env.HTTP_TIMEOUT_MS || 10000);
-
-async function fetchWithTimeout(url, ms = DEFAULT_TIMEOUT_MS, init = {}) {
-  const ctrl = new AbortController();
-  const id = setTimeout(() => ctrl.abort(), ms);
-  try {
-    const res = await fetch(url, { ...init, signal: ctrl.signal, headers: {
-      'user-agent': 'Mozilla/5.0 (Prospector bot; contact info@agentlyne.com)'
-    }});
-    return res;
-  } finally {
-    clearTimeout(id);
-  }
-}
-
-// …wherever you had: const res = await fetch(url)
-// replace with:
-const res = await fetchWithTimeout(url);
