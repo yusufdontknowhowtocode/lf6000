@@ -25,7 +25,7 @@
         <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div>
             <label class="text-sm text-gray-600">Max Sends</label>
-            <input id="cap" type="number" class="mt-1 w-full border rounded px-3 py-2" value="200">
+            <input id="cap" type="number" class="mt-1 w-full border rounded px-3 py-2" value="200" min="1">
           </div>
           <div class="md:col-span-2">
             <label class="text-sm text-gray-600">Subject</label>
@@ -57,11 +57,17 @@ Worth a quick look?
 Don’t want emails like this? Reply “unsubscribe” and I’ll remove you.</textarea>
         </div>
 
-        <div class="flex items-center gap-3">
+        <div class="flex flex-wrap items-center gap-3">
           <button id="run" class="bg-blue-600 hover:bg-blue-700 text-white rounded px-4 py-2">Run</button>
+          <button id="stop" class="bg-red-600 hover:bg-red-700 text-white rounded px-4 py-2 hidden">Stop</button>
           <a id="download" class="text-blue-700 underline hidden" href="#">Download results.csv</a>
-          <div id="stats" class="text-sm text-gray-600 ml-auto"></div>
+          <div class="flex items-center gap-2 ml-auto">
+            <button id="verify" class="text-sm bg-gray-100 hover:bg-gray-200 px-3 py-1.5 rounded">SMTP Verify</button>
+            <input id="testTo" class="text-sm border rounded px-2 py-1" placeholder="you@example.com">
+            <button id="testSend" class="text-sm bg-gray-100 hover:bg-gray-200 px-3 py-1.5 rounded">Send test</button>
+          </div>
         </div>
+        <div id="stats" class="text-sm text-gray-600"></div>
       </div>
 
       <div class="mt-6 bg-white rounded-xl shadow p-5">
@@ -74,13 +80,17 @@ Don’t want emails like this? Reply “unsubscribe” and I’ll remove you.</t
     </div>
 
     <script>
-      const runBtn = document.getElementById("run");
-      const logEl = document.getElementById("log");
-      const clearBtn = document.getElementById("clear");
-      const dl = document.getElementById("download");
-      const statsEl = document.getElementById("stats");
+      const runBtn   = document.getElementById("run");
+      const stopBtn  = document.getElementById("stop");
+      const verifyBtn= document.getElementById("verify");
+      const testTo   = document.getElementById("testTo");
+      const testBtn  = document.getElementById("testSend");
 
-      // persist form locally so you don't have to retype
+      const logEl    = document.getElementById("log");
+      const clearBtn = document.getElementById("clear");
+      const dl       = document.getElementById("download");
+      const statsEl  = document.getElementById("stats");
+
       const FIELDS = ["niche","cities","cap","subject","yourSite","body"];
       function loadSaved() {
         FIELDS.forEach(id => {
@@ -100,12 +110,30 @@ Don’t want emails like this? Reply “unsubscribe” and I’ll remove you.</t
       loadSaved();
       autosave();
 
+      function setDisabled(disabled) {
+        FIELDS.forEach(id => document.getElementById(id).disabled = disabled);
+        runBtn.disabled = disabled;
+        verifyBtn.disabled = disabled;
+        testBtn.disabled = disabled;
+        testTo.disabled = disabled;
+        if (disabled) {
+          runBtn.classList.add("opacity-60","cursor-not-allowed");
+        } else {
+          runBtn.classList.remove("opacity-60","cursor-not-allowed");
+        }
+      }
+
       clearBtn.onclick = () => (logEl.textContent = "");
+
+      let es = null;
+      let currentJobId = null;
 
       runBtn.onclick = async () => {
         dl.classList.add("hidden");
         logEl.textContent = "";
         statsEl.textContent = "Starting…";
+        setDisabled(true);
+        stopBtn.classList.remove("hidden");
 
         const rawBody = document.getElementById("body").value;
         const body = rawBody.replaceAll("{yourSite}", document.getElementById("yourSite").value.trim());
@@ -118,32 +146,85 @@ Don’t want emails like this? Reply “unsubscribe” and I’ll remove you.</t
           body
         };
 
-        const r = await fetch("/api/run", {
-          method:"POST",
-          headers:{ "Content-Type":"application/json" },
-          body: JSON.stringify(payload)
-        });
-        const { jobId, error } = await r.json();
-        if (error) { append(`ERROR: ${error}`); return; }
-
-        const es = new EventSource(`/api/stream?jobId=${jobId}`);
-        es.addEventListener("log", e => {
-          const { ts, message } = JSON.parse(e.data);
-          append(`[${new Date(ts).toLocaleTimeString()}] ${message}`);
-        });
-        es.addEventListener("stats", e => {
-          const s = JSON.parse(e.data);
-          statsEl.textContent = `Found: ${s.found} | With email: ${s.withEmail} | Sent: ${s.sent} | Skipped: ${s.skipped}`;
-        });
-        es.addEventListener("done", e => {
-          const d = JSON.parse(e.data);
-          if (d.file) {
-            dl.href = d.file;
-            dl.classList.remove("hidden");
+        try {
+          const r = await fetch("/api/run", {
+            method:"POST",
+            headers:{ "Content-Type":"application/json" },
+            body: JSON.stringify(payload)
+          });
+          const { jobId, error } = await r.json();
+          if (error || !jobId) {
+            append(`ERROR: ${error || 'no job id'}`);
+            resetUI();
+            return;
           }
-          es.close();
-        });
+          currentJobId = jobId;
+
+          es = new EventSource(`/api/stream?jobId=${jobId}`);
+          es.addEventListener("log", e => {
+            const { ts, message } = JSON.parse(e.data);
+            append(`[${new Date(ts).toLocaleTimeString()}] ${message}`);
+          });
+          es.addEventListener("stats", e => {
+            const s = JSON.parse(e.data);
+            statsEl.textContent = `Found: ${s.found} | With email: ${s.withEmail} | Sent: ${s.sent} | Skipped: ${s.skipped}`;
+          });
+          es.addEventListener("ping", () => {}); // keepalive
+          es.addEventListener("done", e => {
+            const d = JSON.parse(e.data);
+            if (d.file) {
+              dl.href = d.file;
+              dl.classList.remove("hidden");
+            }
+            es.close();
+            es = null;
+            currentJobId = null;
+            resetUI();
+          });
+        } catch (err) {
+          append(`ERROR: ${err.message || err}`);
+          resetUI();
+        }
       };
+
+      stopBtn.onclick = async () => {
+        if (!currentJobId) return;
+        try {
+          await fetch(`/api/cancel?jobId=${encodeURIComponent(currentJobId)}`, { method: 'POST' });
+          append('Requested stop…');
+        } catch (e) {
+          append('Stop request failed.');
+        }
+      };
+
+      verifyBtn.onclick = async () => {
+        try {
+          const r = await fetch('/api/email-verify');
+          const j = await r.json();
+          if (j.ok) append('SMTP verify: OK');
+          else append(`SMTP verify: ${j.error || 'failed'}`);
+        } catch (e) {
+          append(`SMTP verify error: ${e.message || e}`);
+        }
+      };
+
+      testBtn.onclick = async () => {
+        const to = testTo.value.trim();
+        if (!to) { append('Enter a test recipient first.'); return; }
+        try {
+          const r = await fetch(`/api/email-test?to=${encodeURIComponent(to)}`);
+          const j = await r.json();
+          if (j.ok) append(`Test mail queued (id: ${j.id || 'n/a'})`);
+          else append(`Test mail error: ${j.error || 'failed'}`);
+        } catch (e) {
+          append(`Test mail error: ${e.message || e}`);
+        }
+      };
+
+      function resetUI() {
+        setDisabled(false);
+        stopBtn.classList.add("hidden");
+      }
 
       function append(line) {
         logEl.textContent += line + "\n";

@@ -3,13 +3,12 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
-import fs from 'fs';
-import fsp from 'fs/promises';
 import { fileURLToPath } from 'url';
+import fs from 'fs/promises';
 
 import { findBusinesses } from './src/places.js';
 import { findEmailOnSite } from './src/enrich.js';
-import { sendEmail } from './src/mailer.js';
+import { sendEmail, transporter } from './src/mailer.js'; // note transporter
 
 // csv-writer is CJS
 import csvWriterPkg from 'csv-writer';
@@ -20,14 +19,16 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
 
 /* ---------------------------- Private controls --------------------------- */
-app.set('trust proxy', true); // respect X-Forwarded-Proto/IP on Render/CF
+app.set('trust proxy', true);
 
 const BASIC_USER = process.env.BASIC_AUTH_USER || '';
 const BASIC_PASS = process.env.BASIC_AUTH_PASS || '';
 const ALLOW_IPS  = (process.env.ALLOW_IPS || '')
-  .split(',').map(s => s.trim()).filter(Boolean);
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 
-// HTTPS only (redirect if someone hits http behind a proxy)
+// HTTPS only behind proxies
 app.use((req, res, next) => {
   const xfproto = req.headers['x-forwarded-proto'];
   if (xfproto && xfproto !== 'https') {
@@ -35,25 +36,6 @@ app.use((req, res, next) => {
   }
   next();
 });
-
-// --- Basic Auth (optional; enabled only if env vars are set)
-function basicAuth(req, res, next) {
-  const user = process.env.BASIC_AUTH_USER;
-  const pass = process.env.BASIC_AUTH_PASS || '';
-  if (!user) return next(); // disabled if no creds
-
-  const hdr = req.headers.authorization || '';
-  if (!hdr.startsWith('Basic ')) {
-    res.set('WWW-Authenticate', 'Basic realm="LF6000"');
-    return res.status(401).send('Auth required');
-  }
-  const [u, p] = Buffer.from(hdr.slice(6), 'base64').toString().split(':');
-  if (u === user && p === pass) return next();
-
-  res.set('WWW-Authenticate', 'Basic realm="LF6000"');
-  return res.status(401).send('Auth required');
-}
-app.use(basicAuth);
 
 // Optional IP allow-list (before auth)
 app.use((req, res, next) => {
@@ -69,12 +51,12 @@ function requireAuth(req, res, next) {
   if (!BASIC_USER || !BASIC_PASS) return res.status(503).send('Auth not configured');
   const header = req.headers.authorization || '';
   if (!header.startsWith('Basic ')) {
-    res.set('WWW-Authenticate', 'Basic realm="Restricted"');
+    res.set('WWW-Authenticate', 'Basic realm="LF6000"');
     return res.status(401).send('Auth required');
   }
   const [user, pass] = Buffer.from(header.slice(6), 'base64').toString().split(':');
   if (user === BASIC_USER && pass === BASIC_PASS) return next();
-  res.set('WWW-Authenticate', 'Basic realm="Restricted"');
+  res.set('WWW-Authenticate', 'Basic realm="LF6000"');
   return res.status(401).send('Bad credentials');
 }
 app.use(requireAuth);
@@ -86,7 +68,8 @@ app.get('/robots.txt', (_req, res) => {
 
 /* -------------------------- Middleware / static -------------------------- */
 app.disable('x-powered-by');
-// You can lock CORS to your own origin(s) if you want:
+
+// Lock CORS to your own origin(s) if desired (empty = off)
 const corsOrigins = (process.env.CORS_ORIGIN || '').split(',').map(s=>s.trim()).filter(Boolean);
 app.use(cors({
   origin: corsOrigins.length ? corsOrigins : false,
@@ -103,14 +86,44 @@ function sse(res) {
     'Cache-Control': 'no-cache',
     Connection: 'keep-alive',
   });
-  return (event, data) => {
+  const send = (event, data) => {
     res.write(`event: ${event}\n`);
     res.write(`data: ${JSON.stringify(data)}\n\n`);
   };
+  // keepalive ping so proxies don’t close the stream
+  const ping = setInterval(() => send('ping', { t: Date.now() }), 20000);
+  res.on('close', () => clearInterval(ping));
+  return send;
 }
 
+/* ---------------------- Cross-run dedupe (persisted) --------------------- */
+const SENT_FILE = path.join(__dirname, 'sent-emails.json');
+let SENT = new Set();
+async function loadSent() {
+  try {
+    const raw = await fs.readFile(SENT_FILE, 'utf8');
+    const arr = JSON.parse(raw);
+    SENT = new Set(Array.isArray(arr) ? arr : []);
+    console.log(`[dedupe] loaded ${SENT.size} emails`);
+  } catch {
+    SENT = new Set();
+  }
+}
+let saveTimer = null;
+async function queueSaveSent() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(async () => {
+    try {
+      await fs.writeFile(SENT_FILE, JSON.stringify([...SENT], null, 2));
+    } catch (e) {
+      console.warn('[dedupe] save failed:', e?.message);
+    }
+  }, 1000);
+}
+await loadSent();
+
 /* --------------------------------- State -------------------------------- */
-const jobs = new Map();
+const jobs = new Map(); // jobId -> { log, done, file, stats, cancelled, _senders:Set, _hb }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const pushLog = (job, message) => {
   const line = { ts: Date.now(), message: String(message) };
@@ -123,32 +136,19 @@ const pushLog = (job, message) => {
   }
 };
 
-/* -------------------- Persistent sent-registry (dedupe) ------------------ */
-const dataDir  = path.join(__dirname, 'data');
-const sentPath = path.join(dataDir, 'sent.jsonl');
-
-// Load existing sent list (if any)
-if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
-const SENT = new Set();
-if (fs.existsSync(sentPath)) {
-  try {
-    const lines = fs.readFileSync(sentPath, 'utf8').split('\n').map(s => s.trim()).filter(Boolean);
-    for (const line of lines) SENT.add(line.toLowerCase());
-    console.log(`[dedupe] Loaded ${SENT.size} prior emails`);
-  } catch (e) {
-    console.warn('[dedupe] Failed to load file:', e.message);
-  }
-}
-function rememberSent(email) {
-  const key = String(email || '').toLowerCase();
-  if (!key || SENT.has(key)) return;
-  fs.appendFileSync(sentPath, key + '\n');
-  SENT.add(key);
-}
-
 /* ------------------------------- Endpoints ------------------------------- */
 
-// SMTP sanity check
+// SMTP verify / test (handy while tuning creds)
+app.get('/api/email-verify', async (_req, res) => {
+  if (!transporter) return res.status(500).json({ ok:false, error:'smtp_disabled' });
+  try {
+    await transporter.verify();
+    res.json({ ok:true });
+  } catch (e) {
+    res.status(500).json({ ok:false, error:String(e.message || e) });
+  }
+});
+
 app.get('/api/email-test', async (req, res) => {
   try {
     const to = String(req.query.to || process.env.EMAIL_USER || '').trim();
@@ -203,50 +203,49 @@ app.post('/api/run', async (req, res) => {
     .filter(Boolean);
 
   const maxSend = Number(cap || process.env.DEFAULT_SEND_CAP || 200);
-  const perCityCap = Number(process.env.MAX_PER_CITY || 300); // optional
-  const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || 10000);
-
   const jobId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
   const job = {
     log: [],
     done: false,
+    cancelled: false,
     file: null,
     stats: { found: 0, withEmail: 0, sent: 0, skipped: 0 },
   };
   jobs.set(jobId, job);
 
-  // live heartbeat so UI doesn't feel stuck on slow sites
-  job._hb = setInterval(() => pushLog(job, '⏳ still working…'), HEARTBEAT_MS);
-
+  // Background worker
   (async () => {
     const rows = [];
-    const seenEmails = new Set();
+    const seenInRun = new Set();
     const citiesToProcess = cityList.length ? cityList : ['United States'];
 
+    // progress heartbeat every 10s so the UI never looks frozen
+    job._hb = setInterval(() => pushLog(job, '⏳ still working…'), 10000);
+
     for (const city of citiesToProcess) {
+      if (job.cancelled) break;
+
       pushLog(job, `🔎 Searching: "${niche}" in ${city}…`);
 
       let batch = [];
       try {
-        batch = await findBusinesses(city, niche, perCityCap);
+        batch = await findBusinesses(city, niche, 300);
       } catch (e) {
         pushLog(job, `💥 Places error for ${city}: ${String(e)}`);
         continue;
       }
 
-      // safety cap
-      if (perCityCap > 0 && batch.length > perCityCap) batch = batch.slice(0, perCityCap);
-
       pushLog(job, `📍 Found ${batch.length} businesses in ${city}.`);
 
       for (const b of batch) {
+        if (job.cancelled) break;
+
         job.stats.found++;
 
+        // find email from website
         let email = null;
-        try {
-          email = await findEmailOnSite(b.website); // add fetch timeouts INSIDE enrich.js
-        } catch {}
+        try { email = await findEmailOnSite(b.website); } catch {}
 
         if (!email) {
           job.stats.skipped++;
@@ -256,15 +255,16 @@ app.post('/api/run', async (req, res) => {
 
         const key = email.toLowerCase();
 
-        // Skip if seen in this run OR sent in prior runs
-        if (seenEmails.has(key) || SENT.has(key)) {
+        // cross-run dedupe + in-run dedupe
+        if (SENT.has(key) || seenInRun.has(key)) {
           job.stats.skipped++;
           continue;
         }
 
-        seenEmails.add(key);
+        seenInRun.add(key);
         job.stats.withEmail++;
 
+        // Prepare message with tokens
         const ctx = {
           company: b.name || 'your business',
           city,
@@ -275,52 +275,70 @@ app.post('/api/run', async (req, res) => {
         const render = (tpl) => String(tpl || '').replace(/\{(\w+)\}/g, (_, k) => ctx[k] ?? '');
 
         const subj = render(subject || 'Quick idea for {company}');
-        const txt  = render(
-          body || 'Hey {firstName}, quick idea for {company} in {city}. Free demo: {yourSite}'
-        );
+        const txt  = render(body || 'Hey {firstName}, quick idea for {company} in {city}. Free demo: {yourSite}');
 
         try {
           await sendEmail(email, subj, txt);
-          rememberSent(email); // persist dedupe on success
           job.stats.sent++;
           rows.push({ email, company: b.name || '', city, website: b.website || '', status: 'sent' });
+          SENT.add(key);
+          queueSaveSent();
           pushLog(job, `✅ Sent to ${email} (${b.name || 'Unknown'})`);
         } catch (e) {
           job.stats.skipped++;
           rows.push({ email, company: b.name || '', city, website: b.website || '', status: 'send_failed' });
-          pushLog(job, `❌ Send failed to ${email}: ${String(e).slice(0, 180)}`);
+          pushLog(job, `❌ Send failed to ${email}: ${String(e).message || String(e)}`.slice(0, 200));
         }
 
         if (job.stats.sent >= maxSend) break;
-        await sleep(1500); // throttle while warming mailbox
+        await sleep(1500); // throttle
       }
       if (job.stats.sent >= maxSend) break;
     }
 
-    const outPath = path.join(__dirname, `results-${jobId}.csv`);
-    const writer = createObjectCsvWriter({
-      path: outPath,
-      header: [
-        { id: 'email',   title: 'Email' },
-        { id: 'company', title: 'Company' },
-        { id: 'city',    title: 'City' },
-        { id: 'website', title: 'Website' },
-        { id: 'status',  title: 'Status' },
-      ],
-    });
-    await writer.writeRecords(rows);
+    if (job.cancelled) {
+      pushLog(job, '🛑 Stopped by user');
+    }
 
-    job.file = `/download/${path.basename(outPath)}`;
+    // Write CSV next to server.js
+    try {
+      const outPath = path.join(__dirname, `results-${jobId}.csv`);
+      const writer = createObjectCsvWriter({
+        path: outPath,
+        header: [
+          { id: 'email',   title: 'Email' },
+          { id: 'company', title: 'Company' },
+          { id: 'city',    title: 'City' },
+          { id: 'website', title: 'Website' },
+          { id: 'status',  title: 'Status' },
+        ],
+      });
+      await writer.writeRecords(rows);
+      job.file = `/download/${path.basename(outPath)}`;
+    } catch (e) {
+      pushLog(job, `💾 CSV write failed: ${String(e).message || String(e)}`);
+    }
+
+    clearInterval(job._hb);
     job.done = true;
     pushLog(job, '🏁 Job complete');
+    if (job._senders) for (const fn of job._senders) fn('done', { file: job.file, stats: job.stats });
   })().catch((e) => {
+    clearInterval(job._hb);
     pushLog(job, '💥 Job error: ' + String(e));
     job.done = true;
-  }).finally(() => {
-    if (job._hb) clearInterval(job._hb);
   });
 
   res.json({ jobId });
+});
+
+// Cancel a running job
+app.post('/api/cancel', (req, res) => {
+  const { jobId } = req.query;
+  const job = jobs.get(String(jobId || ''));
+  if (!job) return res.status(404).json({ ok:false, error:'not_found' });
+  job.cancelled = true;
+  res.json({ ok:true });
 });
 
 // Stream logs/stats
