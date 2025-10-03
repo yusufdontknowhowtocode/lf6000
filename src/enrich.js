@@ -4,12 +4,13 @@ import { URL } from 'url';
 
 /* -------------------------------- Config -------------------------------- */
 
-const REQUEST_TIMEOUT_MS = Number(process.env.ENRICH_TIMEOUT_MS || 10000);
+const REQUEST_TIMEOUT_MS = Number(process.env.ENRICH_TIMEOUT_MS || 10000);     // per-request soft timeout
+const HARD_TIMEOUT_MS    = Number(process.env.ENRICH_HARD_TIMEOUT_MS || 15000); // overall watchdog per network op
 const THROTTLE_MS        = Number(process.env.ENRICH_THROTTLE_MS || 400);
-const MAX_PAGES          = Number(process.env.ENRICH_MAX_PAGES || 12);   // sitemap/pages cap
+const MAX_PAGES          = Number(process.env.ENRICH_MAX_PAGES || 12);
 const FETCH_SOCIALS      = String(process.env.ENRICH_SOCIALS || '1').match(/^(1|true|yes)$/i);
 
-// Facebook fallback (name search) governors
+// Facebook fallback governors
 const FB_SEARCH_ENABLED   = String(process.env.ENRICH_FB_SEARCH || '1').match(/^(1|true|yes)$/i);
 const FB_SEARCH_MAX_SLUGS = Number(process.env.ENRICH_FB_SEARCH_MAX || 2);
 const FB_SEARCH_TIMEOUT   = Number(process.env.ENRICH_FB_SEARCH_TIMEOUT_MS || 8000);
@@ -18,6 +19,9 @@ const FB_SEARCH_TIMEOUT   = Number(process.env.ENRICH_FB_SEARCH_TIMEOUT_MS || 80
 const NET_MAX_CONCURRENCY = Number(process.env.NET_MAX_CONCURRENCY || 5);
 const NET_RETRY_ATTEMPTS  = Number(process.env.NET_RETRY_ATTEMPTS  || 2);
 const NET_RETRY_BASE_MS   = Number(process.env.NET_RETRY_BASE_MS   || 400);
+
+// Safety: cap how much of a response we read (prevents huge pages from stalling)
+const MAX_BYTES           = Number(process.env.ENRICH_MAX_BYTES || 1_500_000); // ~1.5MB
 
 /* ------------------------- Network helpers (gated) ----------------------- */
 
@@ -29,7 +33,40 @@ async function withNetSlot(fn){
   finally { inflight--; }
 }
 
-async function fetchWithTimeout(url, opts = {}) {
+// Read body with a byte cap; cancels stalled streams safely.
+async function readBodyLimited(res, maxBytes = MAX_BYTES) {
+  // If body is not a stream (undici always is), fallback
+  const reader = res.body?.getReader?.();
+  if (!reader) return await res.text();
+
+  const chunks = [];
+  let received = 0;
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value && value.length) {
+        received += value.length;
+        if (received > maxBytes) {
+          // stop reading anything else
+          try { await reader.cancel(); } catch {}
+          break;
+        }
+        chunks.push(Buffer.from(value));
+      }
+    }
+  } catch (e) {
+    // cancel on error to free socket
+    try { await reader.cancel(); } catch {}
+    throw e;
+  }
+
+  const buf = Buffer.concat(chunks);
+  return new TextDecoder('utf-8', { fatal: false }).decode(buf);
+}
+
+async function fetchWithTimeoutRaw(url, opts = {}) {
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
   try {
@@ -44,19 +81,28 @@ async function fetchWithTimeout(url, opts = {}) {
       ...opts
     });
     const ctype = r.headers.get('content-type') || '';
-    const txt = await r.text();
-    return { ok: r.ok, status: r.status, url: r.url, html: txt, contentType: ctype };
+    // IMPORTANT: limit body size & time
+    const html = await readBodyLimited(r, MAX_BYTES);
+    return { ok: r.ok, status: r.status, url: r.url, html, contentType: ctype };
   } finally {
     clearTimeout(t);
   }
 }
 
+// Hard watchdog around the whole network op (req + body read)
 async function netFetch(url, opts) {
   return withNetSlot(async () => {
     let lastErr;
     for (let i = 0; i <= NET_RETRY_ATTEMPTS; i++) {
-      try { return await fetchWithTimeout(url, opts); }
-      catch (e) { lastErr = e; }
+      try {
+        const result = await Promise.race([
+          fetchWithTimeoutRaw(url, opts),
+          (async () => { await delay(HARD_TIMEOUT_MS); throw new Error('hard_timeout'); })()
+        ]);
+        return result;
+      } catch (e) {
+        lastErr = e;
+      }
       await delay(NET_RETRY_BASE_MS * Math.pow(2, i)); // exp backoff
     }
     throw lastErr;
@@ -90,7 +136,6 @@ function extractEmails(text = '') {
   return [...out];
 }
 
-// JSON-LD blocks sometimes contain `"email": "info@..."` or nested contactPoints, etc.
 function emailsFromJsonLd(html = '') {
   const out = new Set();
   const blocks = html.match(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi) || [];
@@ -111,12 +156,12 @@ function emailsFromJsonLd(html = '') {
           if (typeof v.email === 'string') extractEmails(v.email).forEach(e => out.add(e));
         }
       }
-    } catch { /* ignore malformed */ }
+    } catch {}
   }
   return [...out];
 }
 
-// Cloudflare __cf_email__ decoder
+// Cloudflare obfuscation
 function decodeCfEmail(cfStr) {
   try {
     const r = parseInt(cfStr.slice(0, 2), 16);
@@ -250,17 +295,16 @@ function socialLinks(baseUrl, html = '') {
   return [...out].slice(0, 6);
 }
 
-// Build mbasic "About" URL from any facebook page URL or slug
 function toFacebookAbout(urlOrSlug = '') {
   try {
     const u = new URL(urlOrSlug);
     if (!u.hostname.includes('facebook.com')) return null;
-    const parts = u.pathname.replace(/^\/+/,'').split(/[/?#]/);
+    const parts = u.pathname.replace(/^\/+/, '').split(/[/?#]/);
     const slug = parts[0] || '';
     if (!slug) return null;
     return `https://mbasic.facebook.com/${slug}/about`;
   } catch {
-    const slug = String(urlOrSlug).replace(/^\/+/,'').split(/[/?#]/)[0];
+    const slug = String(urlOrSlug).replace(/^\/+/, '').split(/[/?#]/)[0];
     return slug ? `https://mbasic.facebook.com/${slug}/about` : null;
   }
 }
@@ -269,7 +313,7 @@ async function emailsFromFacebook(urlOrSlug) {
   const aboutUrl = toFacebookAbout(urlOrSlug);
   if (!aboutUrl) return [];
   try {
-    const r = await netFetch(aboutUrl);
+    const r = await netFetch(aboutUrl, { });
     if (!r.ok) return [];
     return uniqLower([
       ...extractEmails(r.html),
@@ -278,15 +322,13 @@ async function emailsFromFacebook(urlOrSlug) {
   } catch { return []; }
 }
 
-// If we don’t have a FB link from the site, try searching FB by name/city (mbasic)
 async function facebookSearchSlugs(query) {
   const q = encodeURIComponent(query.trim());
   const url = `https://mbasic.facebook.com/search/?search=${q}`;
   try {
-    const r = await netFetch(url);
+    const r = await netFetch(url, { });
     if (!r.ok) return [];
     const out = new Set();
-    // look for /<slug>/… links that are likely pages (exclude profile.php and asset links)
     const re = /href="\/([A-Za-z0-9._-]{3,})\/(?!photos|videos|posts|groups|marketplace)[^"]*"/gi;
     let m; while ((m = re.exec(r.html))) out.add(m[1]);
     return [...out].slice(0, FB_SEARCH_MAX_SLUGS);
@@ -315,7 +357,7 @@ function bestEmailForDomain(candidates, siteHost) {
 
 /* ---------------------------- Public main API ---------------------------- */
 
-const sessionCache = new Map(); // domain -> email (per-process)
+const sessionCache = new Map(); // domain -> email
 
 /**
  * @param {string} site Website URL (or any URL from the business)
@@ -324,7 +366,6 @@ const sessionCache = new Map(); // domain -> email (per-process)
 export async function findEmailOnSite(site, hints = {}) {
   const siteUrl = normUrl(site);
 
-  // If we have no site at all, optionally try FB name search
   if (!siteUrl) {
     if (FETCH_SOCIALS && FB_SEARCH_ENABLED && hints?.name) {
       const q = [hints.name, hints.city, hints.state].filter(Boolean).join(' ');
@@ -341,8 +382,8 @@ export async function findEmailOnSite(site, hints = {}) {
   const siteHost = new URL(siteUrl).hostname;
   if (sessionCache.has(siteHost)) return sessionCache.get(siteHost);
 
-  const seen = new Set();   // emails found
-  const visited = new Set(); // urls fetched
+  const seen = new Set();
+  const visited = new Set();
 
   // 1) Homepage
   try {
@@ -400,7 +441,7 @@ export async function findEmailOnSite(site, hints = {}) {
       if (FETCH_SOCIALS && !seen.size) {
         const socials = socialLinks(r.url, html);
 
-        // First: Facebook "About"
+        // Facebook About first (fastest signal)
         const fbLinks = socials.filter(u => /facebook\.com/i.test(u));
         for (const fb of fbLinks) {
           const fbEmails = await emailsFromFacebook(fb);
@@ -409,7 +450,7 @@ export async function findEmailOnSite(site, hints = {}) {
           await delay(THROTTLE_MS);
         }
 
-        // Then: light fetch of other social pages
+        // Light fetch others
         if (!seen.size) {
           for (const sUrl of socials) {
             if (visited.size > MAX_PAGES) break;
@@ -430,12 +471,12 @@ export async function findEmailOnSite(site, hints = {}) {
     }
   } catch {}
 
-  // 2) well-known files
+  // 2) Well-known files
   if (!seen.size) {
     try { (await tryWellKnown(siteUrl)).forEach(e => seen.add(e)); } catch {}
   }
 
-  // 3) Sitemaps (last resort, capped)
+  // 3) Sitemaps (capped)
   if (!seen.size) {
     try {
       const maps = await discoverSitemaps(siteUrl);
@@ -467,7 +508,7 @@ export async function findEmailOnSite(site, hints = {}) {
     } catch {}
   }
 
-  // 4) Still nothing? Try Facebook name search with hints
+  // 4) FB name search fallback
   if (FETCH_SOCIALS && FB_SEARCH_ENABLED && !seen.size && hints?.name) {
     const q = [hints.name, hints.city, hints.state].filter(Boolean).join(' ');
     const slugs = await facebookSearchSlugs(q);
