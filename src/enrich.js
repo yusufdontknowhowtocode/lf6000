@@ -218,7 +218,7 @@ function socialLinks(baseUrl, html = '') {
   return [...out].slice(0, 6);
 }
 
-// Convert any FB page URL -> slug (frostyfixers/) and build mbasic about URL
+// Build mbasic "About" URL from any facebook page URL or slug
 function toFacebookAbout(urlOrSlug = '') {
   try {
     const u = new URL(urlOrSlug);
@@ -237,22 +237,28 @@ async function emailsFromFacebook(urlOrSlug) {
   const aboutUrl = toFacebookAbout(urlOrSlug);
   if (!aboutUrl) return [];
   try {
-    const r = await fetchWithTimeout(aboutUrl, {
-      headers: {
-        // mbasic renders “About” server-side; no login required
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
-        'accept-language': 'en-US,en;q=0.9'
-      }
-    });
+    const r = await fetchWithTimeout(aboutUrl);
     if (!r.ok) return [];
-    // mbasic uses plain text in table-like markup; simple regex works
     return uniqLower([
       ...extractEmails(r.html),
       ...extractObfuscated(r.html)
     ]);
-  } catch {
-    return [];
-  }
+  } catch { return []; }
+}
+
+// If we don’t have a FB link from the site, try searching FB by name/city.
+async function facebookSearchSlugs(query) {
+  const q = encodeURIComponent(query.trim());
+  const url = `https://mbasic.facebook.com/search/?search=${q}`;
+  try {
+    const r = await fetchWithTimeout(url);
+    if (!r.ok) return [];
+    // look for /<slug>/… links that are likely pages (exclude profile.php)
+    const out = new Set();
+    const re = /href="\/([A-Za-z0-9._-]{3,})\/(?!photos|videos|posts)[^"]*"/gi;
+    let m; while ((m = re.exec(r.html))) out.add(m[1]);
+    return [...out].slice(0, 3);
+  } catch { return []; }
 }
 
 /* -------------------------- Email scoring logic -------------------------- */
@@ -279,9 +285,25 @@ function bestEmailForDomain(candidates, siteHost) {
 
 const sessionCache = new Map(); // domain -> email (per-process)
 
-export async function findEmailOnSite(site) {
+/**
+ * @param {string} site Website URL (or any URL from the business)
+ * @param {{name?: string, city?: string, state?: string}} hints Optional hints for social search
+ */
+export async function findEmailOnSite(site, hints = {}) {
   const siteUrl = normUrl(site);
-  if (!siteUrl) return null;
+  if (!siteUrl) {
+    // no site given; try Facebook name search if we have a business name
+    if (FETCH_SOCIALS && hints?.name) {
+      const q = [hints.name, hints.city, hints.state].filter(Boolean).join(' ');
+      const slugs = await facebookSearchSlugs(q);
+      for (const slug of slugs) {
+        const emails = await emailsFromFacebook(slug);
+        if (emails.length) return emails[0];
+        await delay(THROTTLE_MS);
+      }
+    }
+    return null;
+  }
 
   const siteHost = new URL(siteUrl).hostname;
   if (sessionCache.has(siteHost)) return sessionCache.get(siteHost);
@@ -296,7 +318,6 @@ export async function findEmailOnSite(site) {
       visited.add(r.url);
       const html = r.html;
 
-      // direct mailto + visible/plain/JSON-LD + obfuscated + CF protected
       for (const e of [
         ...extractEmails(html),
         ...emailsFromJsonLd(html),
@@ -323,7 +344,7 @@ export async function findEmailOnSite(site) {
         } catch {}
       }
 
-      // docs (pdf/vcf/policies)
+      // docs
       if (!seen.size) {
         const docs = pickDocLinks(r.url, html);
         for (const durl of docs) {
@@ -345,7 +366,6 @@ export async function findEmailOnSite(site) {
       // socials (Facebook special-cased)
       if (FETCH_SOCIALS && !seen.size) {
         const socials = socialLinks(r.url, html);
-        // 1) Try Facebook "About" first (highest hit-rate for SMBs)
         const fbLinks = socials.filter(u => /facebook\.com/i.test(u));
         for (const fb of fbLinks) {
           const fbEmails = await emailsFromFacebook(fb);
@@ -353,7 +373,6 @@ export async function findEmailOnSite(site) {
           if (seen.size) break;
           await delay(THROTTLE_MS);
         }
-        // 2) If still empty, lightly fetch the social pages themselves
         if (!seen.size) {
           for (const sUrl of socials) {
             if (visited.size > MAX_PAGES) break;
@@ -376,10 +395,7 @@ export async function findEmailOnSite(site) {
 
   // 2) well-known files
   if (!seen.size) {
-    try {
-      const found = await tryWellKnown(siteUrl);
-      found.forEach(e => seen.add(e));
-    } catch {}
+    try { (await tryWellKnown(siteUrl)).forEach(e => seen.add(e)); } catch {}
   }
 
   // 3) Sitemaps (last resort, capped)
@@ -412,6 +428,18 @@ export async function findEmailOnSite(site) {
         if (seen.size) break;
       }
     } catch {}
+  }
+
+  // 4) Still nothing? Try Facebook name search with hints (works even if site didn’t link socials)
+  if (FETCH_SOCIALS && !seen.size && hints?.name) {
+    const q = [hints.name, hints.city, hints.state].filter(Boolean).join(' ');
+    const slugs = await facebookSearchSlugs(q);
+    for (const slug of slugs) {
+      const emails = await emailsFromFacebook(slug);
+      emails.forEach(e => seen.add(e));
+      if (seen.size) break;
+      await delay(THROTTLE_MS);
+    }
   }
 
   const uniq = uniqLower([...seen]);
