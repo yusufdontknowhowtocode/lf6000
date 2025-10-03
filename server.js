@@ -6,7 +6,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs/promises';
 
-import { findBusinesses, fetchBusinessesPage } from './src/places.js';
+import { fetchBusinessesPage } from './src/places.js';
 import { findEmailOnSite } from './src/enrich.js';
 import { sendEmail, transporter } from './src/mailer.js';
 
@@ -23,8 +23,7 @@ app.set('trust proxy', true);
 
 const BASIC_USER = process.env.BASIC_AUTH_USER || '';
 const BASIC_PASS = process.env.BASIC_AUTH_PASS || '';
-const ALLOW_IPS  = (process.env.ALLOW_IPS || '')
-  .split(',').map(s => s.trim()).filter(Boolean);
+const ALLOW_IPS  = (process.env.ALLOW_IPS || '').split(',').map(s => s.trim()).filter(Boolean);
 
 process.on('unhandledRejection', (e) => console.error('[unhandledRejection]', e?.stack || e));
 process.on('uncaughtException',  (e) => console.error('[uncaughtException]',  e?.stack || e));
@@ -98,6 +97,14 @@ async function queueSaveSent() {
 }
 await loadSent();
 
+/* --------------------------- Dedupe handy endpoints ---------------------- */
+app.get('/api/dedupe/stats', (_req, res) => res.json({ ok:true, total: SENT.size }));
+app.post('/api/dedupe/clear', async (_req, res) => {
+  SENT = new Set();
+  try { await fs.writeFile(SENT_FILE, '[]'); } catch {}
+  res.json({ ok:true, cleared:true });
+});
+
 /* --------------------------------- State -------------------------------- */
 const jobs = new Map(); // jobId -> { log, done, file, stats, cancelled, _senders:Set, _hb }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -108,7 +115,6 @@ const pushLog = (job, message) => {
 };
 
 /* -------------------------- City fanout + queries ------------------------ */
-/** Expand a single city into boroughs/nearby spots + compass variants. */
 function expandCity(city) {
   const c = String(city || '').trim();
   if (!c) return [];
@@ -128,18 +134,10 @@ function expandCity(city) {
   };
   for (const k of Object.keys(presets)) if (L === k || L.startsWith(k)) return presets[k];
 
-  return [ // generic compass fanout
-    c, `North ${c}`, `South ${c}`, `East ${c}`, `West ${c}`, `${c} Downtown`, `${c} Suburbs`
-  ];
+  return [ c, `North ${c}`, `South ${c}`, `East ${c}`, `West ${c}`, `${c} Downtown`, `${c} Suburbs` ];
 }
-
-/** Try multiple phrasings so Places returns broader sets per area. */
 function cityQueries(niche, city) {
-  return [
-    `${niche} in ${city}`,
-    `${niche} near ${city}`,
-    `${city} ${niche}`
-  ];
+  return [ `${niche} in ${city}`, `${niche} near ${city}`, `${city} ${niche}` ];
 }
 
 /* ------------------------------- Endpoints ------------------------------- */
@@ -149,7 +147,6 @@ app.get('/api/email-verify', async (_req, res) => {
   try { await transporter.verify(); res.json({ ok:true }); }
   catch (e) { res.status(500).json({ ok:false, error:String(e.message || e) }); }
 });
-
 app.get('/api/email-test', async (req, res) => {
   try {
     const to = String(req.query.to || process.env.EMAIL_USER || '').trim();
@@ -192,16 +189,41 @@ app.get('/api/places-test', async (req, res) => {
   }
 });
 
-// Kick off a prospecting run
+/* ---------------------------- Helper: sender ----------------------------- */
+async function trySend(job, rows, {
+  company, area, website, demoSite, subject, body, email
+}) {
+  const ctx = { company: company || 'your business', city: area, firstName: 'there', website: website || '', yourSite: demoSite || '' };
+  const render = (tpl) => String(tpl || '').replace(/\{(\w+)\}/g, (_, k) => ctx[k] ?? '');
+  const subj = render(subject || 'Quick idea for {company}');
+  const txt  = render(body || 'Hey {firstName}, quick idea for {company} in {city}. Free demo: {yourSite}');
+
+  try {
+    await sendEmail(email, subj, txt);
+    job.stats.sent++;
+    rows.push({ email, company, city: area, website, status: 'sent' });
+    pushLog(job, `✅ Sent to ${email} (${company || 'Unknown'})`);
+    return true;
+  } catch (e) {
+    job.stats.skipped++;
+    rows.push({ email, company, city: area, website, status: 'send_failed' });
+    pushLog(job, `❌ Send failed to ${email}: ${String(e?.message || e)}`.slice(0, 200));
+    return false;
+  }
+}
+
+/* -------------------------- Main run: /api/run --------------------------- */
 app.post('/api/run', async (req, res) => {
-  const { niche, cities, cap, subject, body, yourSite, website, site } = req.body || {};
+  const { niche, cities, cap, subject, body, yourSite, website, site, ignorePrevious } = req.body || {};
   if (!niche) return res.status(400).json({ error: 'Missing niche' });
 
   const demoSite = String(yourSite || website || site || process.env.DEMO_SITE || '').trim();
   const cityList = String(cities || '').split(',').map(s => s.trim()).filter(Boolean);
 
-  const maxSend = Number(cap || process.env.DEFAULT_SEND_CAP || 200);
+  const maxSend   = Number(cap || process.env.DEFAULT_SEND_CAP || 200);
   const throttleMs = Number(process.env.SEND_THROTTLE_MS || 1500);
+  const IGNORE_PREV = !!ignorePrevious;
+  const RESEND_ON_SHORTFALL = String(process.env.RESEND_ON_SHORTFALL || '').match(/^(1|true|yes)$/i);
 
   const jobId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const job = {
@@ -213,7 +235,6 @@ app.post('/api/run', async (req, res) => {
   };
   jobs.set(jobId, job);
 
-  // Background worker
   (async () => {
     const rows = [];
     const seenInRunEmails = new Set(); // per-run email dedupe
@@ -222,19 +243,17 @@ app.post('/api/run', async (req, res) => {
     const rawCities = cityList.length ? cityList : ['United States'];
     const areas = rawCities.flatMap(expandCity);
 
-    // heartbeat every 10s so UI never looks frozen
     job._hb = setInterval(() => pushLog(job, '⏳ still working…'), 10000);
 
+    // ---------- Primary pass (new contacts only unless ignorePrevious) ----------
     for (const area of areas) {
       if (job.cancelled || job.stats.sent >= maxSend) break;
 
-      const queries = cityQueries(niche, area);
-      for (const query of queries) {
+      for (const query of cityQueries(niche, area)) {
         if (job.cancelled || job.stats.sent >= maxSend) break;
 
         pushLog(job, `🔎 Searching: "${query}"`);
-        let cursor = null;
-        let pageNo = 0;
+        let cursor = null, pageNo = 0;
 
         while (!job.cancelled && job.stats.sent < maxSend) {
           let items = [];
@@ -267,7 +286,6 @@ app.post('/api/run', async (req, res) => {
             }
             seenInRunSites.add(siteKey);
 
-            // try to find a contact email on their site (w/ social fallbacks handled in enrich.js)
             let email = null;
             try { email = await findEmailOnSite(b.website); } catch {}
             if (!email) {
@@ -277,34 +295,74 @@ app.post('/api/run', async (req, res) => {
             }
 
             const ekey = email.toLowerCase();
-            if (SENT.has(ekey) || seenInRunEmails.has(ekey)) { job.stats.skipped++; continue; }
+
+            // dedupe logic with the new flag
+            if (!IGNORE_PREV && (SENT.has(ekey) || seenInRunEmails.has(ekey))) {
+              job.stats.skipped++;
+              continue;
+            }
+            if (IGNORE_PREV && seenInRunEmails.has(ekey)) { // still avoid dupes inside this run
+              job.stats.skipped++;
+              continue;
+            }
 
             seenInRunEmails.add(ekey);
             job.stats.withEmail++;
 
-            // render subject/body
-            const ctx = { company: b.name || 'your business', city: area, firstName: 'there', website: b.website || '', yourSite: demoSite || '' };
-            const render = (tpl) => String(tpl || '').replace(/\{(\w+)\}/g, (_, k) => ctx[k] ?? '');
-            const subj = render(subject || 'Quick idea for {company}');
-            const txt  = render(body || 'Hey {firstName}, quick idea for {company} in {city}. Free demo: {yourSite}');
-
-            try {
-              await sendEmail(email, subj, txt);
-              job.stats.sent++;
-              rows.push({ email, company: b.name || '', city: area, website: b.website || '', status: 'sent' });
-              SENT.add(ekey); queueSaveSent();
-              pushLog(job, `✅ Sent to ${email} (${b.name || 'Unknown'})`);
-            } catch (e) {
-              job.stats.skipped++;
-              rows.push({ email, company: b.name || '', city: area, website: b.website || '', status: 'send_failed' });
-              pushLog(job, `❌ Send failed to ${email}: ${String(e?.message || e)}`.slice(0, 200));
-            }
+            const sentOk = await trySend(job, rows, {
+              company: b.name, area, website: b.website, demoSite, subject, body, email
+            });
+            if (sentOk) { SENT.add(ekey); queueSaveSent(); }
 
             if (job.stats.sent >= maxSend) break;
             await sleep(throttleMs);
           }
 
-          if (!cursor) break; // no more pages for this query
+          if (!cursor) break;
+        }
+      }
+    }
+
+    // ---------- Fallback pass (optional): allow previously-contacted ----------
+    if (!job.cancelled && job.stats.sent < maxSend && RESEND_ON_SHORTFALL) {
+      pushLog(job, `↩️ Shortfall fallback: allowing previously contacted to reach cap (${job.stats.sent}/${maxSend})`);
+      for (const area of areas) {
+        if (job.cancelled || job.stats.sent >= maxSend) break;
+        for (const query of cityQueries(niche, area)) {
+          if (job.cancelled || job.stats.sent >= maxSend) break;
+          let cursor = null, pageNo = 0;
+          while (!job.cancelled && job.stats.sent < maxSend) {
+            let items = [];
+            try {
+              const page = await fetchBusinessesPage({ query, cursor, pageSize: 20 });
+              items  = page.items || [];
+              cursor = page.nextCursor || null;
+              pageNo++;
+            } catch { break; }
+            if (!items.length) break;
+
+            for (const b of items) {
+              if (job.cancelled || job.stats.sent >= maxSend) break;
+              if (!b.website) continue;
+
+              let email = null;
+              try { email = await findEmailOnSite(b.website); } catch {}
+              if (!email) continue;
+
+              const ekey = email.toLowerCase();
+              if (seenInRunEmails.has(ekey)) continue; // avoid duplicates within THIS run
+              seenInRunEmails.add(ekey);
+              job.stats.withEmail++;
+
+              await trySend(job, rows, {
+                company: b.name, area, website: b.website, demoSite, subject, body, email
+              });
+
+              if (job.stats.sent >= maxSend) break;
+              await sleep(throttleMs);
+            }
+            if (!cursor) break;
+          }
         }
       }
     }
@@ -337,13 +395,13 @@ app.post('/api/run', async (req, res) => {
   })().catch((e) => {
     clearInterval(job._hb);
     pushLog(job, '💥 Job error: ' + String(e));
-    jobs.get(jobId).done = true;
+    const j = jobs.get(jobId); if (j) j.done = true;
   });
 
   res.json({ jobId });
 });
 
-// Cancel a running job
+/* --------------------------- Cancel / Stream / DL ------------------------ */
 app.post('/api/cancel', (req, res) => {
   const { jobId } = req.query;
   const job = jobs.get(String(jobId || ''));
@@ -352,7 +410,6 @@ app.post('/api/cancel', (req, res) => {
   res.json({ ok:true });
 });
 
-// Stream logs/stats
 app.get('/api/stream', (req, res) => {
   const { jobId } = req.query;
   const job = jobs.get(jobId);
@@ -366,7 +423,6 @@ app.get('/api/stream', (req, res) => {
   req.on('close', () => job._senders.delete(send));
 });
 
-// Safe CSV download
 app.get('/download/:file', (req, res) => {
   const base = path.basename(req.params.file || '');
   if (!base.startsWith('results-') || !base.endsWith('.csv')) return res.status(400).send('Bad file name');
