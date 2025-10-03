@@ -6,23 +6,27 @@ import { URL } from 'url';
 
 const REQUEST_TIMEOUT_MS = Number(process.env.ENRICH_TIMEOUT_MS || 10000);
 const THROTTLE_MS        = Number(process.env.ENRICH_THROTTLE_MS || 400);
-const MAX_PAGES          = Number(process.env.ENRICH_MAX_PAGES || 12);  // sitemap/pages cap
+const MAX_PAGES          = Number(process.env.ENRICH_MAX_PAGES || 12);   // sitemap/pages cap
 const FETCH_SOCIALS      = String(process.env.ENRICH_SOCIALS || '1').match(/^(1|true|yes)$/i);
 
-/* ----------------------------- Small utilities --------------------------- */
+// Facebook fallback (name search) governors
+const FB_SEARCH_ENABLED   = String(process.env.ENRICH_FB_SEARCH || '1').match(/^(1|true|yes)$/i);
+const FB_SEARCH_MAX_SLUGS = Number(process.env.ENRICH_FB_SEARCH_MAX || 2);
+const FB_SEARCH_TIMEOUT   = Number(process.env.ENRICH_FB_SEARCH_TIMEOUT_MS || 8000);
 
-function normUrl(u) {
-  if (!u) return null;
-  try {
-    const hasProto = /^[a-z]+:\/\//i.test(u);
-    const url = new URL(hasProto ? u : `https://${u}`);
-    url.hash = '';
-    return url.toString();
-  } catch { return null; }
-}
+// Global network gate
+const NET_MAX_CONCURRENCY = Number(process.env.NET_MAX_CONCURRENCY || 5);
+const NET_RETRY_ATTEMPTS  = Number(process.env.NET_RETRY_ATTEMPTS  || 2);
+const NET_RETRY_BASE_MS   = Number(process.env.NET_RETRY_BASE_MS   || 400);
 
-function absoluteUrl(base, href) {
-  try { return new URL(href, base).toString(); } catch { return null; }
+/* ------------------------- Network helpers (gated) ----------------------- */
+
+let inflight = 0;
+async function withNetSlot(fn){
+  while (inflight >= NET_MAX_CONCURRENCY) await delay(40);
+  inflight++;
+  try { return await fn(); }
+  finally { inflight--; }
 }
 
 async function fetchWithTimeout(url, opts = {}) {
@@ -47,6 +51,34 @@ async function fetchWithTimeout(url, opts = {}) {
   }
 }
 
+async function netFetch(url, opts) {
+  return withNetSlot(async () => {
+    let lastErr;
+    for (let i = 0; i <= NET_RETRY_ATTEMPTS; i++) {
+      try { return await fetchWithTimeout(url, opts); }
+      catch (e) { lastErr = e; }
+      await delay(NET_RETRY_BASE_MS * Math.pow(2, i)); // exp backoff
+    }
+    throw lastErr;
+  });
+}
+
+/* ----------------------------- Small utilities --------------------------- */
+
+function normUrl(u) {
+  if (!u) return null;
+  try {
+    const hasProto = /^[a-z]+:\/\//i.test(u);
+    const url = new URL(hasProto ? u : `https://${u}`);
+    url.hash = '';
+    return url.toString();
+  } catch { return null; }
+}
+
+function absoluteUrl(base, href) {
+  try { return new URL(href, base).toString(); } catch { return null; }
+}
+
 /* -------------------------- Email extraction bits ------------------------ */
 
 function uniqLower(arr) { return [...new Set(arr.map(s => s.toLowerCase()))]; }
@@ -58,25 +90,25 @@ function extractEmails(text = '') {
   return [...out];
 }
 
-// JSON-LD blocks sometimes contain `"email": "info@..."`
+// JSON-LD blocks sometimes contain `"email": "info@..."` or nested contactPoints, etc.
 function emailsFromJsonLd(html = '') {
   const out = new Set();
   const blocks = html.match(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi) || [];
   for (const blk of blocks) {
-    const body = blk.replace(/^<script[^>]*>/i,'').replace(/<\/script>$/i,'');
+    const body = blk.replace(/^<script[^>]*>/i, '').replace(/<\/script>$/i, '');
     try {
       const data = JSON.parse(body);
       const stack = [data];
       while (stack.length) {
         const v = stack.pop();
-        if (!v) continue;
+        if (v == null) continue;
         if (typeof v === 'string') {
           extractEmails(v).forEach(e => out.add(e));
         } else if (Array.isArray(v)) {
           v.forEach(x => stack.push(x));
         } else if (typeof v === 'object') {
           for (const k of Object.keys(v)) stack.push(v[k]);
-          if (v.email && typeof v.email === 'string') extractEmails(v.email).forEach(e => out.add(e));
+          if (typeof v.email === 'string') extractEmails(v.email).forEach(e => out.add(e));
         }
       }
     } catch { /* ignore malformed */ }
@@ -154,7 +186,7 @@ function pickDocLinks(baseUrl, html = '') {
 async function tryWellKnown(base) {
   for (const p of ['/ .well-known/security.txt', '/humans.txt'].map(s => s.replace(' ', ''))) {
     try {
-      const r = await fetchWithTimeout(absoluteUrl(base, p));
+      const r = await netFetch(absoluteUrl(base, p));
       if (r.ok) {
         const emails = [
           ...extractEmails(r.html),
@@ -173,7 +205,7 @@ async function discoverSitemaps(baseUrl) {
   const urls = new Set();
   for (const u of [absoluteUrl(baseUrl, '/robots.txt'), absoluteUrl(baseUrl, '/sitemap.xml')]) {
     try {
-      const r = await fetchWithTimeout(u);
+      const r = await netFetch(u);
       if (!r.ok) continue;
       if (/robots\.txt/i.test(r.url)) {
         const m = r.html.match(/^\s*Sitemap:\s*(\S+)/gim) || [];
@@ -237,7 +269,7 @@ async function emailsFromFacebook(urlOrSlug) {
   const aboutUrl = toFacebookAbout(urlOrSlug);
   if (!aboutUrl) return [];
   try {
-    const r = await fetchWithTimeout(aboutUrl);
+    const r = await netFetch(aboutUrl);
     if (!r.ok) return [];
     return uniqLower([
       ...extractEmails(r.html),
@@ -246,18 +278,18 @@ async function emailsFromFacebook(urlOrSlug) {
   } catch { return []; }
 }
 
-// If we don’t have a FB link from the site, try searching FB by name/city.
+// If we don’t have a FB link from the site, try searching FB by name/city (mbasic)
 async function facebookSearchSlugs(query) {
   const q = encodeURIComponent(query.trim());
   const url = `https://mbasic.facebook.com/search/?search=${q}`;
   try {
-    const r = await fetchWithTimeout(url);
+    const r = await netFetch(url);
     if (!r.ok) return [];
-    // look for /<slug>/… links that are likely pages (exclude profile.php)
     const out = new Set();
-    const re = /href="\/([A-Za-z0-9._-]{3,})\/(?!photos|videos|posts)[^"]*"/gi;
+    // look for /<slug>/… links that are likely pages (exclude profile.php and asset links)
+    const re = /href="\/([A-Za-z0-9._-]{3,})\/(?!photos|videos|posts|groups|marketplace)[^"]*"/gi;
     let m; while ((m = re.exec(r.html))) out.add(m[1]);
-    return [...out].slice(0, 3);
+    return [...out].slice(0, FB_SEARCH_MAX_SLUGS);
   } catch { return []; }
 }
 
@@ -291,9 +323,10 @@ const sessionCache = new Map(); // domain -> email (per-process)
  */
 export async function findEmailOnSite(site, hints = {}) {
   const siteUrl = normUrl(site);
+
+  // If we have no site at all, optionally try FB name search
   if (!siteUrl) {
-    // no site given; try Facebook name search if we have a business name
-    if (FETCH_SOCIALS && hints?.name) {
+    if (FETCH_SOCIALS && FB_SEARCH_ENABLED && hints?.name) {
       const q = [hints.name, hints.city, hints.state].filter(Boolean).join(' ');
       const slugs = await facebookSearchSlugs(q);
       for (const slug of slugs) {
@@ -313,7 +346,7 @@ export async function findEmailOnSite(site, hints = {}) {
 
   // 1) Homepage
   try {
-    const r = await fetchWithTimeout(siteUrl);
+    const r = await netFetch(siteUrl);
     if (r.ok) {
       visited.add(r.url);
       const html = r.html;
@@ -330,7 +363,7 @@ export async function findEmailOnSite(site, hints = {}) {
       for (const u of candidates) {
         if (visited.size > MAX_PAGES) break;
         try {
-          const r2 = await fetchWithTimeout(u);
+          const r2 = await netFetch(u);
           if (!r2.ok) continue;
           visited.add(r2.url);
           for (const e of [
@@ -350,7 +383,7 @@ export async function findEmailOnSite(site, hints = {}) {
         for (const durl of docs) {
           if (visited.size > MAX_PAGES) break;
           try {
-            const r3 = await fetchWithTimeout(durl);
+            const r3 = await netFetch(durl);
             if (!r3.ok) continue;
             visited.add(r3.url);
             for (const e of [
@@ -366,6 +399,8 @@ export async function findEmailOnSite(site, hints = {}) {
       // socials (Facebook special-cased)
       if (FETCH_SOCIALS && !seen.size) {
         const socials = socialLinks(r.url, html);
+
+        // First: Facebook "About"
         const fbLinks = socials.filter(u => /facebook\.com/i.test(u));
         for (const fb of fbLinks) {
           const fbEmails = await emailsFromFacebook(fb);
@@ -373,11 +408,13 @@ export async function findEmailOnSite(site, hints = {}) {
           if (seen.size) break;
           await delay(THROTTLE_MS);
         }
+
+        // Then: light fetch of other social pages
         if (!seen.size) {
           for (const sUrl of socials) {
             if (visited.size > MAX_PAGES) break;
             try {
-              const r4 = await fetchWithTimeout(sUrl);
+              const r4 = await netFetch(sUrl);
               if (!r4.ok) continue;
               visited.add(r4.url);
               for (const e of [
@@ -405,14 +442,14 @@ export async function findEmailOnSite(site, hints = {}) {
       let fetched = 0;
       for (const mapUrl of maps) {
         if (fetched > MAX_PAGES) break;
-        const sm = await fetchWithTimeout(mapUrl);
+        const sm = await netFetch(mapUrl);
         if (!sm.ok) continue;
         const urls = extractUrlsFromSitemap(sm.html).slice(0, 25);
         for (const u of urls) {
           if (visited.has(u)) continue;
           if (fetched++ > MAX_PAGES) break;
           try {
-            const r = await fetchWithTimeout(u);
+            const r = await netFetch(u);
             if (!r.ok) continue;
             visited.add(r.url);
             for (const e of [
@@ -430,8 +467,8 @@ export async function findEmailOnSite(site, hints = {}) {
     } catch {}
   }
 
-  // 4) Still nothing? Try Facebook name search with hints (works even if site didn’t link socials)
-  if (FETCH_SOCIALS && !seen.size && hints?.name) {
+  // 4) Still nothing? Try Facebook name search with hints
+  if (FETCH_SOCIALS && FB_SEARCH_ENABLED && !seen.size && hints?.name) {
     const q = [hints.name, hints.city, hints.state].filter(Boolean).join(' ');
     const slugs = await facebookSearchSlugs(q);
     for (const slug of slugs) {
