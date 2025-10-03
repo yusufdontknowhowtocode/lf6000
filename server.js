@@ -6,7 +6,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs/promises';
 
-import { findBusinesses } from './src/places.js';
+import { findBusinesses, fetchBusinessesPage } from './src/places.js';
 import { findEmailOnSite } from './src/enrich.js';
 import { sendEmail, transporter } from './src/mailer.js'; // note transporter
 
@@ -27,6 +27,7 @@ const ALLOW_IPS  = (process.env.ALLOW_IPS || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
+
 process.on('unhandledRejection', (e) => {
   console.error('[unhandledRejection]', e?.stack || e);
 });
@@ -144,7 +145,7 @@ const pushLog = (job, message) => {
 
 /* ------------------------------- Endpoints ------------------------------- */
 
-// SMTP verify / test (handy while tuning creds)
+// SMTP verify / test
 app.get('/api/email-verify', async (_req, res) => {
   if (!transporter) return res.status(500).json({ ok:false, error:'smtp_disabled' });
   try {
@@ -190,8 +191,9 @@ app.get('/api/defaults', (_req, res) => {
 app.get('/api/places-test', async (req, res) => {
   try {
     const { city = 'Austin', niche = 'orthodontist' } = req.query;
-    const rows = await findBusinesses(String(city), String(niche), 10);
-    res.json({ ok: true, count: rows.length, sample: rows.slice(0, 5) });
+    // one pager for fast test
+    const { items } = await fetchBusinessesPage({ query: `${niche} in ${city}`, pageSize: 10 });
+    res.json({ ok: true, count: items.length, sample: items.slice(0, 5) });
   } catch (e) {
     res.status(500).json({ ok: false, error: String(e.message || e) });
   }
@@ -223,83 +225,112 @@ app.post('/api/run', async (req, res) => {
   // Background worker
   (async () => {
     const rows = [];
-    const seenInRun = new Set();
-    const citiesToProcess = cityList.length ? cityList : ['United States'];
+    const seenInRunEmails = new Set();   // per-run email dedupe
+    const seenInRunSites  = new Set();   // per-run website dedupe
 
+    const citiesToProcess = cityList.length ? cityList : ['United States'];
     // progress heartbeat every 10s so the UI never looks frozen
     job._hb = setInterval(() => pushLog(job, '⏳ still working…'), 10000);
 
     for (const city of citiesToProcess) {
-      if (job.cancelled) break;
+      if (job.cancelled || job.stats.sent >= maxSend) break;
 
       pushLog(job, `🔎 Searching: "${niche}" in ${city}…`);
+      let cursor = null;
+      let pages  = 0;
+      const query = `${niche} in ${city}`;
 
-      let batch = [];
-      try {
-        batch = await findBusinesses(city, niche, 300);
-      } catch (e) {
-        pushLog(job, `💥 Places error for ${city}: ${String(e)}`);
-        continue;
-      }
-
-      pushLog(job, `📍 Found ${batch.length} businesses in ${city}.`);
-
-      for (const b of batch) {
-        if (job.cancelled) break;
-
-        job.stats.found++;
-
-        // find email from website
-        let email = null;
-        try { email = await findEmailOnSite(b.website); } catch {}
-
-        if (!email) {
-          job.stats.skipped++;
-          pushLog(job, `❎ No email for ${b.name || 'Unknown'} (${city})`);
-          continue;
-        }
-
-        const key = email.toLowerCase();
-
-        // cross-run dedupe + in-run dedupe
-        if (SENT.has(key) || seenInRun.has(key)) {
-          job.stats.skipped++;
-          continue;
-        }
-
-        seenInRun.add(key);
-        job.stats.withEmail++;
-
-        // Prepare message with tokens
-        const ctx = {
-          company: b.name || 'your business',
-          city,
-          firstName: 'there',
-          website: b.website || '',
-          yourSite: demoSite || ''
-        };
-        const render = (tpl) => String(tpl || '').replace(/\{(\w+)\}/g, (_, k) => ctx[k] ?? '');
-
-        const subj = render(subject || 'Quick idea for {company}');
-        const txt  = render(body || 'Hey {firstName}, quick idea for {company} in {city}. Free demo: {yourSite}');
-
+      while (!job.cancelled && job.stats.sent < maxSend) {
+        let items = [];
         try {
-          await sendEmail(email, subj, txt);
-          job.stats.sent++;
-          rows.push({ email, company: b.name || '', city, website: b.website || '', status: 'sent' });
-          SENT.add(key);
-          queueSaveSent();
-          pushLog(job, `✅ Sent to ${email} (${b.name || 'Unknown'})`);
+          const page = await fetchBusinessesPage({
+            query,
+            cursor,
+            pageSize: 20,
+          });
+          items  = page.items || [];
+          cursor = page.nextCursor || null;
+          pages++;
         } catch (e) {
-          job.stats.skipped++;
-          rows.push({ email, company: b.name || '', city, website: b.website || '', status: 'send_failed' });
-          pushLog(job, `❌ Send failed to ${email}: ${String(e).message || String(e)}`.slice(0, 200));
+          pushLog(job, `💥 Places error for ${city}: ${String(e)}`);
+          break;
         }
 
-        if (job.stats.sent >= maxSend) break;
-        await sleep(1500); // throttle
+        if (!items.length) {
+          pushLog(job, pages === 1 ? `📭 No results for ${city}` : `📭 No more results for ${city} (pages=${pages-1})`);
+          break;
+        }
+
+        pushLog(job, `📍 Page ${pages}: ${items.length} businesses in ${city}.`);
+
+        // Process this page serially (stable + keeps within rate limits)
+        for (const b of items) {
+          if (job.cancelled) break;
+          if (job.stats.sent >= maxSend) break;
+
+          job.stats.found++;
+
+          const siteKey = (b.website || '').toLowerCase();
+          if (!b.website || seenInRunSites.has(siteKey)) {
+            job.stats.skipped++;
+            if (!b.website) pushLog(job, `❎ No website for ${b.name || 'Unknown'} (${city})`);
+            continue;
+          }
+          seenInRunSites.add(siteKey);
+
+          // find email from website
+          let email = null;
+          try { email = await findEmailOnSite(b.website); } catch {}
+
+          if (!email) {
+            job.stats.skipped++;
+            pushLog(job, `❎ No email for ${b.name || 'Unknown'} (${city})`);
+            continue;
+          }
+
+          const key = email.toLowerCase();
+          // cross-run dedupe + in-run dedupe
+          if (SENT.has(key) || seenInRunEmails.has(key)) {
+            job.stats.skipped++;
+            continue;
+          }
+
+          seenInRunEmails.add(key);
+          job.stats.withEmail++;
+
+          // Prepare message with tokens
+          const ctx = {
+            company: b.name || 'your business',
+            city,
+            firstName: 'there',
+            website: b.website || '',
+            yourSite: demoSite || ''
+          };
+          const render = (tpl) => String(tpl || '').replace(/\{(\w+)\}/g, (_, k) => ctx[k] ?? '');
+
+          const subj = render(subject || 'Quick idea for {company}');
+          const txt  = render(body || 'Hey {firstName}, quick idea for {company} in {city}. Free demo: {yourSite}');
+
+          try {
+            await sendEmail(email, subj, txt);
+            job.stats.sent++;
+            rows.push({ email, company: b.name || '', city, website: b.website || '', status: 'sent' });
+            SENT.add(key);
+            queueSaveSent();
+            pushLog(job, `✅ Sent to ${email} (${b.name || 'Unknown'})`);
+          } catch (e) {
+            job.stats.skipped++;
+            rows.push({ email, company: b.name || '', city, website: b.website || '', status: 'send_failed' });
+            pushLog(job, `❌ Send failed to ${email}: ${String(e?.message || e)}`.slice(0, 200));
+          }
+
+          if (job.stats.sent >= maxSend) break;
+          await sleep(Number(process.env.SEND_THROTTLE_MS || 1500)); // throttle between sends
+        }
+
+        // If Places has no next page, leave the paging loop
+        if (!cursor) break;
       }
-      if (job.stats.sent >= maxSend) break;
     }
 
     if (job.cancelled) {
@@ -322,7 +353,7 @@ app.post('/api/run', async (req, res) => {
       await writer.writeRecords(rows);
       job.file = `/download/${path.basename(outPath)}`;
     } catch (e) {
-      pushLog(job, `💾 CSV write failed: ${String(e).message || String(e)}`);
+      pushLog(job, `💾 CSV write failed: ${String(e?.message || e)}`);
     }
 
     clearInterval(job._hb);
