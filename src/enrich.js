@@ -14,10 +14,8 @@ const FETCH_SOCIALS      = String(process.env.ENRICH_SOCIALS || '1').match(/^(1|
 function normUrl(u) {
   if (!u) return null;
   try {
-    // add protocol if missing
     const hasProto = /^[a-z]+:\/\//i.test(u);
     const url = new URL(hasProto ? u : `https://${u}`);
-    // drop fragments
     url.hash = '';
     return url.toString();
   } catch { return null; }
@@ -36,7 +34,8 @@ async function fetchWithTimeout(url, opts = {}) {
       signal: ctrl.signal,
       headers: {
         'user-agent': 'Mozilla/5.0 (ProspectorBot; +https://example.com)',
-        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'accept-language': 'en-US,en;q=0.9'
       },
       ...opts
     });
@@ -53,10 +52,35 @@ async function fetchWithTimeout(url, opts = {}) {
 function uniqLower(arr) { return [...new Set(arr.map(s => s.toLowerCase()))]; }
 
 function extractEmails(text = '') {
-  // basic email (no internationalized domain here)
   const re = /([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,24})/gi;
   const out = new Set();
   let m; while ((m = re.exec(text))) out.add(m[1]);
+  return [...out];
+}
+
+// JSON-LD blocks sometimes contain `"email": "info@..."`
+function emailsFromJsonLd(html = '') {
+  const out = new Set();
+  const blocks = html.match(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi) || [];
+  for (const blk of blocks) {
+    const body = blk.replace(/^<script[^>]*>/i,'').replace(/<\/script>$/i,'');
+    try {
+      const data = JSON.parse(body);
+      const stack = [data];
+      while (stack.length) {
+        const v = stack.pop();
+        if (!v) continue;
+        if (typeof v === 'string') {
+          extractEmails(v).forEach(e => out.add(e));
+        } else if (Array.isArray(v)) {
+          v.forEach(x => stack.push(x));
+        } else if (typeof v === 'object') {
+          for (const k of Object.keys(v)) stack.push(v[k]);
+          if (v.email && typeof v.email === 'string') extractEmails(v.email).forEach(e => out.add(e));
+        }
+      }
+    } catch { /* ignore malformed */ }
+  }
   return [...out];
 }
 
@@ -87,11 +111,9 @@ function extractObfuscated(text = '') {
   const s = text.replace(/\u200B|\u200C|\u200D/g, ''); // strip zero-width
   const out = new Set();
 
-  // name [at] domain [dot] tld  OR name(at)domain(dot)tld
   const re1 = /([A-Z0-9._%+-]+)\s*(?:\(|\[)?\s*at\s*(?:\)|\])?\s*([A-Z0-9.-]+)\s*(?:\(|\[)?\s*dot\s*(?:\)|\])?\s*([A-Z]{2,24})/gi;
   let m1; while ((m1 = re1.exec(s))) out.add(`${m1[1]}@${m1[2]}.${m1[3]}`);
 
-  // name @ domain . tld with spaces
   const re2 = /([A-Z0-9._%+-]+)\s*\(?\s*@\s*\)?\s*([A-Z0-9.-]+)\s*\.\s*([A-Z]{2,24})/gi;
   let m2; while ((m2 = re2.exec(s))) out.add(`${m2[1]}@${m2[2]}.${m2[3]}`);
 
@@ -99,7 +121,6 @@ function extractObfuscated(text = '') {
 }
 
 function pickLikelyPages(baseUrl, html = '') {
-  // Extract a few candidate links: contact, about, team, privacy, legal, impressum
   const out = new Set();
   const re = /<a\b[^>]*?href\s*=\s*["']([^"']+)["'][^>]*>(.*?)<\/a>/gsi;
   let m;
@@ -175,7 +196,7 @@ function extractUrlsFromSitemap(xml = '') {
 /* ------------------------------- Socials --------------------------------- */
 
 const SOCIAL_DOMAINS = [
-  'facebook.com', 'm.facebook.com',
+  'facebook.com', 'm.facebook.com', 'mbasic.facebook.com',
   'instagram.com',
   'x.com', 'twitter.com',
   'linkedin.com'
@@ -194,7 +215,44 @@ function socialLinks(baseUrl, html = '') {
       if (SOCIAL_DOMAINS.some(d => u.hostname.endsWith(d))) out.add(abs);
     } catch {}
   }
-  return [...out].slice(0, 4);
+  return [...out].slice(0, 6);
+}
+
+// Convert any FB page URL -> slug (frostyfixers/) and build mbasic about URL
+function toFacebookAbout(urlOrSlug = '') {
+  try {
+    const u = new URL(urlOrSlug);
+    if (!u.hostname.includes('facebook.com')) return null;
+    const parts = u.pathname.replace(/^\/+/,'').split(/[/?#]/);
+    const slug = parts[0] || '';
+    if (!slug) return null;
+    return `https://mbasic.facebook.com/${slug}/about`;
+  } catch {
+    const slug = String(urlOrSlug).replace(/^\/+/,'').split(/[/?#]/)[0];
+    return slug ? `https://mbasic.facebook.com/${slug}/about` : null;
+  }
+}
+
+async function emailsFromFacebook(urlOrSlug) {
+  const aboutUrl = toFacebookAbout(urlOrSlug);
+  if (!aboutUrl) return [];
+  try {
+    const r = await fetchWithTimeout(aboutUrl, {
+      headers: {
+        // mbasic renders “About” server-side; no login required
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
+        'accept-language': 'en-US,en;q=0.9'
+      }
+    });
+    if (!r.ok) return [];
+    // mbasic uses plain text in table-like markup; simple regex works
+    return uniqLower([
+      ...extractEmails(r.html),
+      ...extractObfuscated(r.html)
+    ]);
+  } catch {
+    return [];
+  }
 }
 
 /* -------------------------- Email scoring logic -------------------------- */
@@ -208,14 +266,8 @@ function bestEmailForDomain(candidates, siteHost) {
     let s = 0;
     if (domain === host) s += 50;
     if (domain.endsWith('.' + host)) s += 40;
-
-    // role accounts
     if (/^(info|contact|hello|office|support|sales|bookings|admin|team|service|hi)\@/i.test(e)) s += 8;
-
-    // deprioritize free webmail
     if (/(gmail\.com|yahoo\.com|hotmail\.com|outlook\.com|aol\.com)$/i.test(domain)) s -= 20;
-
-    // shorter is cleaner
     s -= Math.max(0, e.length - 24) * 0.1;
     return s;
   }
@@ -225,7 +277,7 @@ function bestEmailForDomain(candidates, siteHost) {
 
 /* ---------------------------- Public main API ---------------------------- */
 
-const sessionCache = new Map(); // domain -> email (memory per process)
+const sessionCache = new Map(); // domain -> email (per-process)
 
 export async function findEmailOnSite(site) {
   const siteUrl = normUrl(site);
@@ -234,7 +286,7 @@ export async function findEmailOnSite(site) {
   const siteHost = new URL(siteUrl).hostname;
   if (sessionCache.has(siteHost)) return sessionCache.get(siteHost);
 
-  const seen = new Set(); // emails found
+  const seen = new Set();   // emails found
   const visited = new Set(); // urls fetched
 
   // 1) Homepage
@@ -247,6 +299,7 @@ export async function findEmailOnSite(site) {
       // direct mailto + visible/plain/JSON-LD + obfuscated + CF protected
       for (const e of [
         ...extractEmails(html),
+        ...emailsFromJsonLd(html),
         ...extractObfuscated(html),
         ...emailsFromCloudflare(html)
       ]) seen.add(e);
@@ -261,6 +314,7 @@ export async function findEmailOnSite(site) {
           visited.add(r2.url);
           for (const e of [
             ...extractEmails(r2.html),
+            ...emailsFromJsonLd(r2.html),
             ...extractObfuscated(r2.html),
             ...emailsFromCloudflare(r2.html)
           ]) seen.add(e);
@@ -288,22 +342,33 @@ export async function findEmailOnSite(site) {
         }
       }
 
-      // socials (light)
+      // socials (Facebook special-cased)
       if (FETCH_SOCIALS && !seen.size) {
         const socials = socialLinks(r.url, html);
-        for (const sUrl of socials) {
-          if (visited.size > MAX_PAGES) break;
-          try {
-            const r4 = await fetchWithTimeout(sUrl);
-            if (!r4.ok) continue;
-            visited.add(r4.url);
-            for (const e of [
-              ...extractEmails(r4.html),
-              ...extractObfuscated(r4.html)
-            ]) seen.add(e);
-            if (seen.size) break;
-            await delay(THROTTLE_MS);
-          } catch {}
+        // 1) Try Facebook "About" first (highest hit-rate for SMBs)
+        const fbLinks = socials.filter(u => /facebook\.com/i.test(u));
+        for (const fb of fbLinks) {
+          const fbEmails = await emailsFromFacebook(fb);
+          fbEmails.forEach(e => seen.add(e));
+          if (seen.size) break;
+          await delay(THROTTLE_MS);
+        }
+        // 2) If still empty, lightly fetch the social pages themselves
+        if (!seen.size) {
+          for (const sUrl of socials) {
+            if (visited.size > MAX_PAGES) break;
+            try {
+              const r4 = await fetchWithTimeout(sUrl);
+              if (!r4.ok) continue;
+              visited.add(r4.url);
+              for (const e of [
+                ...extractEmails(r4.html),
+                ...extractObfuscated(r4.html)
+              ]) seen.add(e);
+              if (seen.size) break;
+              await delay(THROTTLE_MS);
+            } catch {}
+          }
         }
       }
     }
@@ -336,6 +401,7 @@ export async function findEmailOnSite(site) {
             visited.add(r.url);
             for (const e of [
               ...extractEmails(r.html),
+              ...emailsFromJsonLd(r.html),
               ...extractObfuscated(r.html),
               ...emailsFromCloudflare(r.html)
             ]) seen.add(e);
