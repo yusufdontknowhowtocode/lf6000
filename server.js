@@ -27,6 +27,12 @@ const ALLOW_IPS  = (process.env.ALLOW_IPS || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
+process.on('unhandledRejection', (e) => {
+  console.error('[unhandledRejection]', e?.stack || e);
+});
+process.on('uncaughtException', (e) => {
+  console.error('[uncaughtException]', e?.stack || e);
+});
 
 // HTTPS only behind proxies
 app.use((req, res, next) => {
