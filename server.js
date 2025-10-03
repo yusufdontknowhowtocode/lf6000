@@ -114,26 +114,50 @@ const pushLog = (job, message) => {
   if (job._senders) for (const fn of job._senders) { fn('log', line); fn('stats', job.stats); }
 };
 
+/* ----------------------- Concurrency pool (parallelize) ------------------ */
+const CONCURRENCY = Number(process.env.LEAD_CONCURRENCY || 6);
+async function runPool(tasks, limit = CONCURRENCY) {
+  const q = tasks.slice();
+  const workers = Array.from({ length: Math.min(limit, q.length || 0) }, async () => {
+    while (q.length) { const t = q.shift(); try { await t(); } catch {} }
+  });
+  await Promise.all(workers);
+}
+
 /* -------------------------- City fanout + queries ------------------------ */
+// Expand metro names and whole STATES into many metros for broader coverage.
 function expandCity(city) {
   const c = String(city || '').trim();
   if (!c) return [];
   const L = c.toLowerCase();
 
-  const presets = {
-    'new york': ['New York', 'Manhattan', 'Brooklyn', 'Queens', 'Bronx', 'Staten Island', 'Long Island', 'Jersey City', 'Hoboken', 'Newark'],
-    'los angeles': ['Los Angeles', 'Santa Monica', 'Beverly Hills', 'Pasadena', 'Burbank', 'Glendale', 'Long Beach'],
-    'chicago': ['Chicago', 'Evanston', 'Oak Park', 'Skokie', 'Cicero'],
-    'miami': ['Miami', 'Miami Beach', 'Coral Gables', 'Hialeah', 'Doral', 'North Miami'],
-    'dallas': ['Dallas', 'Plano', 'Richardson', 'Irving', 'Arlington', 'Garland'],
-    'houston': ['Houston', 'Sugar Land', 'Pearland', 'Pasadena TX', 'Spring', 'The Woodlands'],
-    'san francisco': ['San Francisco', 'Oakland', 'Berkeley', 'Daly City', 'San Mateo', 'San Jose'],
-    'seattle': ['Seattle', 'Bellevue', 'Redmond', 'Kirkland', 'Renton'],
-    'boston': ['Boston', 'Cambridge', 'Somerville', 'Brookline', 'Quincy'],
-    'atlanta': ['Atlanta', 'Sandy Springs', 'Decatur', 'Marietta', 'Smyrna'],
+  // State → metro fanout
+  const states = {
+    'pennsylvania': ['Philadelphia','Pittsburgh','Allentown','Erie','Reading','Scranton','Harrisburg','Lancaster','Bethlehem','York','State College','Wilkes-Barre'],
+    'texas': ['Houston','San Antonio','Dallas','Austin','Fort Worth','El Paso','Arlington','Plano','Corpus Christi','Lubbock'],
+    'florida': ['Miami','Orlando','Tampa','Jacksonville','St. Petersburg','Hialeah','Fort Lauderdale','Tallahassee','Sarasota','Boca Raton'],
+    'california': ['Los Angeles','San Diego','San Jose','San Francisco','Sacramento','Fresno','Long Beach','Oakland','Bakersfield','Riverside'],
+    'new york': ['New York','Buffalo','Rochester','Yonkers','Syracuse','Albany','White Plains'],
+    'illinois': ['Chicago','Aurora','Naperville','Joliet','Elgin','Waukegan'],
   };
-  for (const k of Object.keys(presets)) if (L === k || L.startsWith(k)) return presets[k];
+  for (const k of Object.keys(states)) if (L === k) return states[k];
 
+  // Metro presets
+  const metros = {
+    'new york city': ['New York','Manhattan','Brooklyn','Queens','Bronx','Staten Island','Long Island','Jersey City','Hoboken','Newark'],
+    'los angeles': ['Los Angeles','Santa Monica','Beverly Hills','Pasadena','Burbank','Glendale','Long Beach'],
+    'chicago': ['Chicago','Evanston','Oak Park','Skokie','Cicero'],
+    'miami': ['Miami','Miami Beach','Coral Gables','Hialeah','Doral','North Miami'],
+    'dallas': ['Dallas','Plano','Richardson','Irving','Arlington','Garland'],
+    'houston': ['Houston','Sugar Land','Pearland','Pasadena TX','Spring','The Woodlands'],
+    'san francisco': ['San Francisco','Oakland','Berkeley','Daly City','San Mateo','San Jose'],
+    'seattle': ['Seattle','Bellevue','Redmond','Kirkland','Renton'],
+    'boston': ['Boston','Cambridge','Somerville','Brookline','Quincy'],
+    'atlanta': ['Atlanta','Sandy Springs','Decatur','Marietta','Smyrna'],
+  };
+  for (const k of Object.keys(metros)) if (L === k) return metros[k];
+
+  // Generic compass fanout
   return [ c, `North ${c}`, `South ${c}`, `East ${c}`, `West ${c}`, `${c} Downtown`, `${c} Suburbs` ];
 }
 function cityQueries(niche, city) {
@@ -220,8 +244,11 @@ app.post('/api/run', async (req, res) => {
   const demoSite = String(yourSite || website || site || process.env.DEMO_SITE || '').trim();
   const cityList = String(cities || '').split(',').map(s => s.trim()).filter(Boolean);
 
-  const maxSend   = Number(cap || process.env.DEFAULT_SEND_CAP || 200);
-  const throttleMs = Number(process.env.SEND_THROTTLE_MS || 1500);
+  const maxSend    = Number(process.env.DEFAULT_SEND_CAP || 200);
+  const requested  = Number(cap || maxSend);
+  const targetCap  = Math.min(requested, maxSend);
+
+  const throttleMs  = Number(process.env.SEND_THROTTLE_MS || 1500);
   const IGNORE_PREV = !!ignorePrevious;
   const RESEND_ON_SHORTFALL = String(process.env.RESEND_ON_SHORTFALL || '').match(/^(1|true|yes)$/i);
 
@@ -247,15 +274,15 @@ app.post('/api/run', async (req, res) => {
 
     // ---------- Primary pass (new contacts only unless ignorePrevious) ----------
     for (const area of areas) {
-      if (job.cancelled || job.stats.sent >= maxSend) break;
+      if (job.cancelled || job.stats.sent >= targetCap) break;
 
       for (const query of cityQueries(niche, area)) {
-        if (job.cancelled || job.stats.sent >= maxSend) break;
+        if (job.cancelled || job.stats.sent >= targetCap) break;
 
         pushLog(job, `🔎 Searching: "${query}"`);
         let cursor = null, pageNo = 0;
 
-        while (!job.cancelled && job.stats.sent < maxSend) {
+        while (!job.cancelled && job.stats.sent < targetCap) {
           let items = [];
           try {
             const page = await fetchBusinessesPage({ query, cursor, pageSize: 20 });
@@ -273,8 +300,9 @@ app.post('/api/run', async (req, res) => {
           }
           pushLog(job, `📍 Page ${pageNo}: ${items.length} businesses.`);
 
-          for (const b of items) {
-            if (job.cancelled || job.stats.sent >= maxSend) break;
+          // --- Parallel per-page processing ---
+          await runPool(items.map(b => async () => {
+            if (job.cancelled || job.stats.sent >= targetCap) return;
 
             job.stats.found++;
 
@@ -282,7 +310,7 @@ app.post('/api/run', async (req, res) => {
             if (!b.website || seenInRunSites.has(siteKey)) {
               job.stats.skipped++;
               if (!b.website) pushLog(job, `❎ No website for ${b.name || 'Unknown'}`);
-              continue;
+              return;
             }
             seenInRunSites.add(siteKey);
 
@@ -291,7 +319,7 @@ app.post('/api/run', async (req, res) => {
             if (!email) {
               job.stats.skipped++;
               pushLog(job, `❎ No email for ${b.name || 'Unknown'}`);
-              continue;
+              return;
             }
 
             const ekey = email.toLowerCase();
@@ -299,11 +327,11 @@ app.post('/api/run', async (req, res) => {
             // dedupe logic with the new flag
             if (!IGNORE_PREV && (SENT.has(ekey) || seenInRunEmails.has(ekey))) {
               job.stats.skipped++;
-              continue;
+              return;
             }
-            if (IGNORE_PREV && seenInRunEmails.has(ekey)) { // still avoid dupes inside this run
+            if (IGNORE_PREV && seenInRunEmails.has(ekey)) {
               job.stats.skipped++;
-              continue;
+              return;
             }
 
             seenInRunEmails.add(ekey);
@@ -314,9 +342,8 @@ app.post('/api/run', async (req, res) => {
             });
             if (sentOk) { SENT.add(ekey); queueSaveSent(); }
 
-            if (job.stats.sent >= maxSend) break;
-            await sleep(throttleMs);
-          }
+            if (throttleMs > 0) await sleep(throttleMs); // light pacing
+          }), CONCURRENCY);
 
           if (!cursor) break;
         }
@@ -324,14 +351,14 @@ app.post('/api/run', async (req, res) => {
     }
 
     // ---------- Fallback pass (optional): allow previously-contacted ----------
-    if (!job.cancelled && job.stats.sent < maxSend && RESEND_ON_SHORTFALL) {
-      pushLog(job, `↩️ Shortfall fallback: allowing previously contacted to reach cap (${job.stats.sent}/${maxSend})`);
+    if (!job.cancelled && job.stats.sent < targetCap && RESEND_ON_SHORTFALL) {
+      pushLog(job, `↩️ Shortfall fallback: allowing previously contacted to reach cap (${job.stats.sent}/${targetCap})`);
       for (const area of areas) {
-        if (job.cancelled || job.stats.sent >= maxSend) break;
+        if (job.cancelled || job.stats.sent >= targetCap) break;
         for (const query of cityQueries(niche, area)) {
-          if (job.cancelled || job.stats.sent >= maxSend) break;
+          if (job.cancelled || job.stats.sent >= targetCap) break;
           let cursor = null, pageNo = 0;
-          while (!job.cancelled && job.stats.sent < maxSend) {
+          while (!job.cancelled && job.stats.sent < targetCap) {
             let items = [];
             try {
               const page = await fetchBusinessesPage({ query, cursor, pageSize: 20 });
@@ -341,16 +368,16 @@ app.post('/api/run', async (req, res) => {
             } catch { break; }
             if (!items.length) break;
 
-            for (const b of items) {
-              if (job.cancelled || job.stats.sent >= maxSend) break;
-              if (!b.website) continue;
+            await runPool(items.map(b => async () => {
+              if (job.cancelled || job.stats.sent >= targetCap) return;
+              if (!b.website) return;
 
               let email = null;
               try { email = await findEmailOnSite(b.website); } catch {}
-              if (!email) continue;
+              if (!email) return;
 
               const ekey = email.toLowerCase();
-              if (seenInRunEmails.has(ekey)) continue; // avoid duplicates within THIS run
+              if (seenInRunEmails.has(ekey)) return; // avoid duplicates in THIS run
               seenInRunEmails.add(ekey);
               job.stats.withEmail++;
 
@@ -358,9 +385,9 @@ app.post('/api/run', async (req, res) => {
                 company: b.name, area, website: b.website, demoSite, subject, body, email
               });
 
-              if (job.stats.sent >= maxSend) break;
-              await sleep(throttleMs);
-            }
+              if (throttleMs > 0) await sleep(throttleMs);
+            }), CONCURRENCY);
+
             if (!cursor) break;
           }
         }
