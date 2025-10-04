@@ -47,9 +47,11 @@ app.use((req, res, next) => {
 /* ------------------------------ Public static ---------------------------- */
 /* BIMI needs anonymous access to your logo. This serves /brand/* without auth. */
 app.use('/brand', express.static(path.join(__dirname, 'public/brand'), {
-  setHeaders: (res) => {
+  setHeaders: (res, filePath) => {
     res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-    res.setHeader('Content-Type', 'image/svg+xml; charset=utf-8');
+    if (filePath.endsWith('.svg')) {
+      res.setHeader('Content-Type', 'image/svg+xml; charset=utf-8');
+    }
   }
 }));
 
@@ -69,7 +71,8 @@ function requireAuth(req, res, next) {
 }
 
 app.use((req, res, next) => {
-  if (req.path.startsWith('/brand/')) return next();
+  // allow /brand and /brand/...
+  if (req.path === '/brand' || req.path.startsWith('/brand/')) return next();
   return requireAuth(req, res, next);
 });
 
