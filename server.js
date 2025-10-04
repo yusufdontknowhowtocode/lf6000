@@ -44,7 +44,17 @@ app.use((req, res, next) => {
   res.status(403).send('Forbidden');
 });
 
-/* -------------------------------- Basic auth ----------------------------- */
+/* ------------------------------ Public static ---------------------------- */
+/* BIMI needs anonymous access to your logo. This serves /brand/* without auth. */
+app.use('/brand', express.static(path.join(__dirname, 'public/brand'), {
+  setHeaders: (res) => {
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    res.setHeader('Content-Type', 'image/svg+xml; charset=utf-8');
+  }
+}));
+
+/* ------------------------------- Basic auth ------------------------------ */
+// Protect everything EXCEPT /brand (and optionally robots if you want it public)
 function requireAuth(req, res, next) {
   if (!BASIC_USER || !BASIC_PASS) return res.status(503).send('Auth not configured');
   const header = req.headers.authorization || '';
@@ -57,7 +67,11 @@ function requireAuth(req, res, next) {
   res.set('WWW-Authenticate', 'Basic realm="LF6000"');
   return res.status(401).send('Bad credentials');
 }
-app.use(requireAuth);
+
+app.use((req, res, next) => {
+  if (req.path.startsWith('/brand/')) return next();
+  return requireAuth(req, res, next);
+});
 
 /* ----------------------------- robots (private) -------------------------- */
 app.get('/robots.txt', (_req, res) => res.type('text/plain').send('User-agent: *\nDisallow: /\n'));
@@ -69,9 +83,10 @@ const corsOrigins = (process.env.CORS_ORIGIN || '').split(',').map(s=>s.trim()).
 app.use(cors({ origin: corsOrigins.length ? corsOrigins : false, credentials: false }));
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
+
+// Keep your regular static under auth
 app.use(express.static(path.join(__dirname, 'public'), { extensions: ['html'] }));
 app.use('/public', express.static(path.join(__dirname, 'public'), { extensions: ['html'] }));
-app.use('/brand', express.static(path.join(__dirname, 'public/brand')));
 
 /* ------------------------------ SSE helper ------------------------------ */
 function sse(res) {
@@ -127,13 +142,11 @@ async function runPool(tasks, limit = CONCURRENCY) {
 }
 
 /* -------------------------- City fanout + queries ------------------------ */
-// Expand metro names and whole STATES into many metros for broader coverage.
 function expandCity(city) {
   const c = String(city || '').trim();
   if (!c) return [];
   const L = c.toLowerCase();
 
-  // State → metro fanout
   const states = {
     'pennsylvania': ['Philadelphia','Pittsburgh','Allentown','Erie','Reading','Scranton','Harrisburg','Lancaster','Bethlehem','York','State College','Wilkes-Barre'],
     'texas': ['Houston','San Antonio','Dallas','Austin','Fort Worth','El Paso','Arlington','Plano','Corpus Christi','Lubbock'],
@@ -144,7 +157,6 @@ function expandCity(city) {
   };
   for (const k of Object.keys(states)) if (L === k) return states[k];
 
-  // Metro presets
   const metros = {
     'new york city': ['New York','Manhattan','Brooklyn','Queens','Bronx','Staten Island','Long Island','Jersey City','Hoboken','Newark'],
     'los angeles': ['Los Angeles','Santa Monica','Beverly Hills','Pasadena','Burbank','Glendale','Long Beach'],
@@ -159,7 +171,6 @@ function expandCity(city) {
   };
   for (const k of Object.keys(metros)) if (L === k) return metros[k];
 
-  // Generic compass fanout
   return [ c, `North ${c}`, `South ${c}`, `East ${c}`, `West ${c}`, `${c} Downtown`, `${c} Suburbs` ];
 }
 function cityQueries(niche, city) {
@@ -274,7 +285,7 @@ app.post('/api/run', async (req, res) => {
 
     job._hb = setInterval(() => pushLog(job, '⏳ still working…'), 10000);
 
-    // ---------- Primary pass (new contacts only unless ignorePrevious) ----------
+    // Primary pass (new contacts)
     for (const area of areas) {
       if (job.cancelled || job.stats.sent >= targetCap) break;
 
@@ -302,7 +313,6 @@ app.post('/api/run', async (req, res) => {
           }
           pushLog(job, `📍 Page ${pageNo}: ${items.length} businesses.`);
 
-          // --- Parallel per-page processing ---
           await runPool(items.map(b => async () => {
             if (job.cancelled || job.stats.sent >= targetCap) return;
 
@@ -325,16 +335,8 @@ app.post('/api/run', async (req, res) => {
             }
 
             const ekey = email.toLowerCase();
-
-            // dedupe logic with the new flag
-            if (!IGNORE_PREV && (SENT.has(ekey) || seenInRunEmails.has(ekey))) {
-              job.stats.skipped++;
-              return;
-            }
-            if (IGNORE_PREV && seenInRunEmails.has(ekey)) {
-              job.stats.skipped++;
-              return;
-            }
+            if (!IGNORE_PREV && (SENT.has(ekey) || seenInRunEmails.has(ekey))) { job.stats.skipped++; return; }
+            if (IGNORE_PREV && seenInRunEmails.has(ekey)) { job.stats.skipped++; return; }
 
             seenInRunEmails.add(ekey);
             job.stats.withEmail++;
@@ -344,7 +346,7 @@ app.post('/api/run', async (req, res) => {
             });
             if (sentOk) { SENT.add(ekey); queueSaveSent(); }
 
-            if (throttleMs > 0) await sleep(throttleMs); // light pacing
+            if (throttleMs > 0) await sleep(throttleMs);
           }), CONCURRENCY);
 
           if (!cursor) break;
@@ -352,7 +354,7 @@ app.post('/api/run', async (req, res) => {
       }
     }
 
-    // ---------- Fallback pass (optional): allow previously-contacted ----------
+    // Fallback (optional): allow previously-contacted to reach cap
     if (!job.cancelled && job.stats.sent < targetCap && RESEND_ON_SHORTFALL) {
       pushLog(job, `↩️ Shortfall fallback: allowing previously contacted to reach cap (${job.stats.sent}/${targetCap})`);
       for (const area of areas) {
@@ -379,7 +381,7 @@ app.post('/api/run', async (req, res) => {
               if (!email) return;
 
               const ekey = email.toLowerCase();
-              if (seenInRunEmails.has(ekey)) return; // avoid duplicates in THIS run
+              if (seenInRunEmails.has(ekey)) return;
               seenInRunEmails.add(ekey);
               job.stats.withEmail++;
 
